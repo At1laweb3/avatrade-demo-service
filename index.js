@@ -21,16 +21,53 @@ async function launchBrowser() {
   });
 }
 
-// Helpers (rade i za Page i za Frame)
-async function typeInto(ctx, selector, value, timeout = 25000) {
-  await ctx.waitForSelector(selector, { timeout });
-  const el = await ctx.$(selector);
+// ---- FRAME HELPERS ----
+async function findAuthFrame(page, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  const emailSel = "input[type='email'], input[placeholder*='mail' i], input[name*='email' i]";
+  const passSel  = "input[type='password'], input[placeholder*='password' i], input[name*='password' i]";
+
+  while (Date.now() < deadline) {
+    for (const f of page.frames()) {
+      try {
+        const e = await f.$(emailSel);
+        const p = await f.$(passSel);
+        if (e && p) return f;
+      } catch { /* frame maybe detaching, ignore */ }
+    }
+    await sleep(300);
+  }
+  throw new Error("Auth frame not found");
+}
+
+async function withAuthFrame(page, fn, retries = 3) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const f = await findAuthFrame(page, 30000);
+      return await fn(f);
+    } catch (e) {
+      lastErr = e;
+      // Ako je “detached frame” ili “Execution context was destroyed” – probaj ponovo
+      if (!String(e).toLowerCase().includes("detached") &&
+          !String(e).toLowerCase().includes("execution context was destroyed")) {
+        break;
+      }
+      await sleep(500);
+    }
+  }
+  throw lastErr;
+}
+
+async function typeIntoFrame(frame, selector, value) {
+  await frame.waitForSelector(selector, { timeout: 25000 });
+  const el = await frame.$(selector);
   await el.click({ clickCount: 3 });
   await el.type(value, { delay: 30 });
 }
 
-async function clickByTextVisibleCtx(ctx, selector, texts) {
-  return await ctx.evaluate(({ selector, texts }) => {
+async function clickByTextVisibleCtx(frame, selector, texts) {
+  return await frame.evaluate(({ selector, texts }) => {
     const tset = texts.map(t => t.toLowerCase());
     const els = Array.from(document.querySelectorAll(selector));
     const el = els.find(e => {
@@ -43,29 +80,7 @@ async function clickByTextVisibleCtx(ctx, selector, texts) {
   }, { selector, texts });
 }
 
-// Nađi frame koji sadrži email/password input
-async function findAuthFrame(page, timeoutMs = 25000) {
-  const emailSelectors = ["input[type='email']", "input[placeholder*='mail' i]", "input[name*='email' i]"];
-  const passSelectors  = ["input[type='password']", "input[placeholder*='password' i]", "input[name*='password' i]"];
-
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    const frames = page.frames();
-    for (const f of frames) {
-      const emailEl = await Promise.any(
-        emailSelectors.map(sel => f.$(sel))
-      ).catch(() => null);
-      const passEl  = await Promise.any(
-        passSelectors.map(sel => f.$(sel))
-      ).catch(() => null);
-
-      if (emailEl && passEl) return f;
-    }
-    await sleep(500);
-  }
-  throw new Error("Auth frame not found");
-}
-
+// ---- ROUTE ----
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, country = "Serbia" } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ ok:false, error: "Missing fields" });
@@ -76,11 +91,11 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     const page = await browser.newPage();
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) Idi DIREKTNO na /demo-account (stabilnije nego klik na “Free Demo”)
+    // 1) DIREKTAN URL za demo (stabilnije)
     await page.goto("https://www.avatrade.com/demo-account", { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
 
-    // (Ako ima cookie/subscribe bar – pokušaj zatvaranje na glavnoj stranici)
+    // (Opcionalno) zatvori cookie/subscribe na parent strani
     try {
       await page.evaluate(() => {
         const tryClick = (texts) => {
@@ -97,37 +112,43 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       });
     } catch {}
 
-    // 2) Pronađi iframe koji sadrži polja
-    const authFrame = await findAuthFrame(page, 30000);
+    // 2) Email + Password (uvek prvo pronađi svež frame)
+    const emailSel = "input[type='email'], input[placeholder*='mail' i], input[name*='email' i]";
+    const passSel  = "input[type='password'], input[placeholder*='password' i], input[name*='password' i]";
 
-    // 3) Popuni Email & Password
-    await typeInto(authFrame, "input[type='email'], input[placeholder*='mail' i], input[name*='email' i]", email);
-    await typeInto(authFrame, "input[type='password'], input[placeholder*='password' i], input[name*='password' i]", password);
+    await withAuthFrame(page, async (f) => {
+      await typeIntoFrame(f, emailSel, email);
+      await typeIntoFrame(f, passSel, password);
+    });
 
-    // 4) Country dropdown (u frame-u)
-    let opened = await clickByTextVisibleCtx(authFrame, "div,span,button", ["Choose a country", "Country", "Select country"]);
-    if (!opened) {
-      const cInput = await authFrame.$("input[placeholder*='Country' i], input[role='combobox'], input[type='search']");
-      if (cInput) await cInput.click();
-    }
-    await sleep(400);
+    // 3) Country dropdown + izbor
+    await withAuthFrame(page, async (f) => {
+      let opened = await clickByTextVisibleCtx(f, "div,span,button", ["Choose a country", "Country", "Select country"]);
+      if (!opened) {
+        const cInput = await f.$("input[placeholder*='Country' i], input[role='combobox'], input[type='search']");
+        if (cInput) await cInput.click();
+      }
+      await sleep(400);
 
-    const searchBox = await authFrame.$("input[type='search'], input[role='combobox'], input[aria-autocomplete='list']");
-    if (searchBox) {
-      await searchBox.type(country, { delay: 35 });
-      await authFrame.keyboard.press("Enter");
-    } else {
-      await clickByTextVisibleCtx(authFrame, "*", [country]);
-    }
+      const searchBox = await f.$("input[type='search'], input[role='combobox'], input[aria-autocomplete='list']");
+      if (searchBox) {
+        await searchBox.type(country, { delay: 35 });
+        await f.keyboard.press("Enter");
+      } else {
+        await clickByTextVisibleCtx(f, "*", [country]);
+      }
+    });
 
-    // 5) Submit — “Practice For Free” (u frame-u)
-    let submitClicked = await clickByTextVisibleCtx(authFrame, "button,a", ["Practice For Free", "Practice for free", "Create account", "Register"]);
-    if (!submitClicked) throw new Error("Submit button not found in frame");
+    // 4) Submit
+    await withAuthFrame(page, async (f) => {
+      let submitClicked = await clickByTextVisibleCtx(f, "button,a", ["Practice For Free", "Practice for free", "Create account", "Register"]);
+      if (!submitClicked) throw new Error("Submit button not found in frame");
+    });
 
-    // 6) Sačekaj backend (MT info scraping dodajemo kasnije)
+    // 5) Sačekaj backend – (MT info scraping dodajemo posle)
     await sleep(7000);
 
-    res.json({ ok: true, note: "Submit ok via iframe + /demo-account. MT info scraping TBD." });
+    res.json({ ok: true, note: "Submit ok via iframe with re-acquire. MT info scraping TBD." });
 
   } catch (e) {
     console.error("create-demo error:", e?.message || e);
