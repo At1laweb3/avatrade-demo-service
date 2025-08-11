@@ -1,5 +1,4 @@
-// index.js
-// Express + Puppeteer servis: AvaTrade demo signup (forma na /demo-account, bez iframe-a)
+// index.js — AvaTrade demo signup (robustan klik + izbor države)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -10,7 +9,6 @@ app.use(express.json());
 const SHARED_SECRET = process.env.PUPPETEER_SHARED_SECRET || "superSecret123";
 const PORT = process.env.PORT || 3000;
 
-// ---- helpers ----
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function checkAuth(req, res, next) {
@@ -28,31 +26,65 @@ async function launchBrowser() {
   });
 }
 
+// --- helpers ---
+async function safeClick(page, selector) {
+  const el = await page.$(selector);
+  if (!el) return false;
+  try {
+    await el.evaluate((e) => e.scrollIntoView({ block: "center", inline: "center" }));
+  } catch {}
+  try {
+    await el.click({ delay: 40 });
+    return true;
+  } catch {
+    // fallback: JS click (za slučaj overlay-a)
+    try {
+      await page.evaluate((e) => e && e.click(), el);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
 async function clickByTextVisible(page, selector, texts) {
   return await page.evaluate(({ selector, texts }) => {
-    const tset = texts.map((t) => t.toLowerCase());
+    const lows = texts.map((t) => t.toLowerCase());
     const els = Array.from(document.querySelectorAll(selector));
     const el = els.find((e) => {
-      const txt = (e.textContent || "").trim().toLowerCase();
-      const vis =
-        !!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
-      return vis && tset.some((t) => txt.includes(t));
+      const txt = ((e.textContent || e.getAttribute("placeholder") || "") + "").toLowerCase().trim();
+      const vis = !!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
+      return vis && lows.some((t) => txt.includes(t));
     });
-    if (el) {
-      el.click();
-      return true;
-    }
+    if (el) { el.click(); return true; }
     return false;
   }, { selector, texts });
 }
 
-// Robusno biranje države u njihovom dropdownu (radi i kad nema search boxa)
-async function selectCountry(page, countryName) {
-  // Otvori dropdown
-  await page.click(".country-wrapper .vue-country-select .dropdown", { delay: 50 }).catch(() => {});
-  await sleep(400);
+// otvori dropdown: probaj više selektora + clickByText + JS fallback
+async function openCountryDropdown(page) {
+  const tries = [
+    ".country-wrapper .vue-country-select .dropdown",
+    ".country-wrapper .vue-country-select input",
+    "input[placeholder='Choose a country']",
+    ".country-wrapper .selected-flag",
+    ".country-wrapper", // poslednji pokušaj: klik na wrapper
+  ];
+  for (const sel of tries) {
+    if (await safeClick(page, sel)) {
+      await sleep(300);
+      if (await page.$(".dropdown-list")) return true;
+    }
+  }
+  const byText = await clickByTextVisible(page, "button,div,span,input", [
+    "Choose a country", "Country", "Select country",
+  ]);
+  await sleep(300);
+  return !!(await page.$(".dropdown-list"));
+}
 
-  // 1) Probaj search (ako postoji)
+async function pickCountry(page, countryName) {
+  // 1) probaj search ako postoji
   const searchSel = ".dropdown-list input[type='search'], .dropdown-list input[role='combobox'], .dropdown-list input[aria-autocomplete='list']";
   const search = await page.$(searchSel);
   if (search) {
@@ -62,47 +94,32 @@ async function selectCountry(page, countryName) {
     return true;
   }
 
-  // 2) Ako nema searcha – klik stavku po flag klasi ili po tekstu; skroluj listu
-  // (flag za Srbiju im je .vti__flag.rs)
-  const flag = await page.$("li.dropdown-item .vti__flag.rs");
-  if (flag) {
-    await flag.click();
-    return true;
-  }
+  // 2) probaj flag za Srbiju
+  const flag = await page.$(".dropdown-list li.dropdown-item .vti__flag.rs");
+  if (flag) { await flag.click(); return true; }
 
-  // Fallback: traži tekst "Serbia" ili "Serbia (Србија)" u <strong> unutar stavke
-  const clicked = await page.evaluate((target) => {
-    const term = target.toLowerCase();
-    const list = document.querySelector(".dropdown-list");
-    if (!list) return false;
-
-    function visible(el) {
-      return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length));
-    }
-
-    // prođi više puta kroz listu uz skrol
-    for (let pass = 0; pass < 40; pass++) {
-      const items = Array.from(list.querySelectorAll("li.dropdown-item strong")).filter(visible);
-      const match = items.find((n) => (n.textContent || "").trim().toLowerCase().includes(term));
-      if (match) {
-        match.click();
-        return true;
-      }
-      list.scrollBy(0, 250);
+  // 3) scroll + klik po tekstu (Serbia / Serbia (Србија))
+  const names = [countryName, "Serbia (Србија)"];
+  const clicked = await page.evaluate((names) => {
+    const list = document.querySelector(".dropdown-list") || document.body;
+    function visible(el){ return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length)); }
+    for (let pass = 0; pass < 60; pass++) {
+      const items = Array.from(list.querySelectorAll("li.dropdown-item, li, div.dropdown-item")).filter(visible);
+      const target = items.find(it => {
+        const txt = (it.textContent || "").trim().toLowerCase();
+        return names.some(n => txt.includes(n.toLowerCase()));
+      });
+      if (target) { target.click(); return true; }
+      list.scrollBy(0, 260);
     }
     return false;
-  }, countryName);
-
+  }, names);
   return clicked;
 }
 
-// Izvuci kratki tekst sa strane (za debug) i pokušaj da nađeš MT info
 async function extractPageInfo(page) {
-  const text = await page.evaluate(() =>
-    document.body ? document.body.innerText : ""
-  );
+  const text = await page.evaluate(() => document.body ? document.body.innerText : "");
   const excerpt = (text || "").replace(/\s+/g, " ").slice(0, 1200);
-
   const out = { found: false, login: null, server: null, password: null, excerpt };
   if (!text) return out;
 
@@ -114,73 +131,58 @@ async function extractPageInfo(page) {
   if (serverMatch) out.server = serverMatch[1].trim();
   if (passMatch) out.password = passMatch[1];
   if (out.login && out.server) out.found = true;
-
   return out;
 }
 
-// ---- route ----
+// --- route ---
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, country = "Serbia" } = req.body || {};
-  if (!name || !email || !password) {
-    return res.status(400).json({ ok: false, error: "Missing fields" });
-  }
+  if (!name || !email || !password) return res.status(400).json({ ok:false, error:"Missing fields" });
 
   let browser;
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-    );
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) Direktno na demo-formu
-    await page.goto("https://www.avatrade.com/demo-account", {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    });
-    await sleep(1200);
+    // 1) demo forma
+    await page.goto("https://www.avatrade.com/demo-account", { waitUntil: "networkidle2", timeout: 60000 });
+    await sleep(1000);
 
-    // 2) Zatvori moguće cookie/subscribe barove
-    try {
-      await clickByTextVisible(page, "button,a", [
-        "Accept",
-        "Accept All",
-        "I agree",
-        "Got it",
-        "Not Now",
-        "Close",
-      ]);
-    } catch {}
+    // 2) cookies/subscribe close (ako ima)
+    try { await clickByTextVisible(page, "button,a", ["Accept","Accept All","I agree","Got it","Not Now","Close"]); } catch {}
 
-    // 3) Polja forme (po ID-jevima iz DOM-a)
+    // 3) polja
     await page.waitForSelector("#input-email", { timeout: 25000 });
     await page.waitForSelector("#input-password", { timeout: 25000 });
+    await page.click("#input-email", { clickCount: 3 }); await page.type("#input-email", email, { delay: 30 });
+    await page.click("#input-password", { clickCount: 3 }); await page.type("#input-password", password, { delay: 30 });
 
-    await page.click("#input-email", { clickCount: 3 });
-    await page.type("#input-email", email, { delay: 30 });
+    // 4) country
+    const opened = await openCountryDropdown(page);
+    if (!opened) throw new Error("Country dropdown not opened");
+    const picked = await pickCountry(page, country);
+    if (!picked) throw new Error(`Country '${country}' not selected`);
+    await sleep(400);
 
-    await page.click("#input-password", { clickCount: 3 });
-    await page.type("#input-password", password, { delay: 30 });
-
-    // 4) Izbor države – robustno (radi i bez search boxa)
-    const selected = await selectCountry(page, country);
-    if (!selected) throw new Error(`Country '${country}' not selected`);
-
-    // 5) Sačekaj da submit postane aktivan, pa pošalji
+    // 5) submit (koristi JS click ako običan klik ne može)
     await page.waitForFunction(() => {
-      const b = document.querySelector(
-        ".submit-button button[type='submit']"
-      );
+      const b = document.querySelector(".submit-button button[type='submit']");
       return b && !b.disabled;
     }, { timeout: 20000 });
 
-    await page.click(".submit-button button[type='submit']");
+    const clicked = await safeClick(page, ".submit-button button[type='submit']");
+    if (!clicked) {
+      await page.evaluate(() => {
+        const b = document.querySelector(".submit-button button[type='submit']");
+        if (b) b.click();
+      });
+    }
+
     await sleep(7000);
 
-    // 6) Pokušaj detekcije uspeha/MT info i kratkog teksta za debug
+    // 6) info za debug + eventualni MT podaci
     const mt = await extractPageInfo(page);
-
-    // (opciono) screenshot za Railway filesystem (možeš da skineš iz “Deployments → Files”)
     try { await page.screenshot({ path: "after_submit.png", fullPage: true }); } catch {}
 
     return res.json({
@@ -189,17 +191,16 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       url: page.url(),
       mt_login: mt.login,
       mt_server: mt.server,
-      mt_password: mt.password || password, // često je isto, ali MT šalje svoj pass mailom
+      mt_password: mt.password || password,
       page_excerpt: mt.excerpt,
     });
   } catch (e) {
     console.error("create-demo error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: String(e) });
+    return res.status(500).json({ ok:false, error: String(e) });
   } finally {
     try { if (browser) await browser.close(); } catch {}
   }
 });
 
-// healthcheck
 app.get("/", (_req, res) => res.send("AvaTrade Demo Service live"));
 app.listen(PORT, () => console.log("Listening on", PORT));
