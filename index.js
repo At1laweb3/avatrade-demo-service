@@ -1,4 +1,4 @@
-// index.js — AvaTrade demo signup (robustan klik + izbor države)
+// index.js — AvaTrade demo signup (robust clicks + country select + submit fallbacks)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -26,7 +26,7 @@ async function launchBrowser() {
   });
 }
 
-// --- helpers ---
+// ---------- HELPERI ----------
 async function safeClick(page, selector) {
   const el = await page.$(selector);
   if (!el) return false;
@@ -37,7 +37,6 @@ async function safeClick(page, selector) {
     await el.click({ delay: 40 });
     return true;
   } catch {
-    // fallback: JS click (za slučaj overlay-a)
     try {
       await page.evaluate((e) => e && e.click(), el);
       return true;
@@ -61,14 +60,13 @@ async function clickByTextVisible(page, selector, texts) {
   }, { selector, texts });
 }
 
-// otvori dropdown: probaj više selektora + clickByText + JS fallback
 async function openCountryDropdown(page) {
   const tries = [
     ".country-wrapper .vue-country-select .dropdown",
     ".country-wrapper .vue-country-select input",
     "input[placeholder='Choose a country']",
     ".country-wrapper .selected-flag",
-    ".country-wrapper", // poslednji pokušaj: klik na wrapper
+    ".country-wrapper",
   ];
   for (const sel of tries) {
     if (await safeClick(page, sel)) {
@@ -76,15 +74,13 @@ async function openCountryDropdown(page) {
       if (await page.$(".dropdown-list")) return true;
     }
   }
-  const byText = await clickByTextVisible(page, "button,div,span,input", [
-    "Choose a country", "Country", "Select country",
-  ]);
+  await clickByTextVisible(page, "button,div,span,input", ["Choose a country","Country","Select country"]);
   await sleep(300);
   return !!(await page.$(".dropdown-list"));
 }
 
 async function pickCountry(page, countryName) {
-  // 1) probaj search ako postoji
+  // 1) search polje (ako postoji)
   const searchSel = ".dropdown-list input[type='search'], .dropdown-list input[role='combobox'], .dropdown-list input[aria-autocomplete='list']";
   const search = await page.$(searchSel);
   if (search) {
@@ -93,12 +89,11 @@ async function pickCountry(page, countryName) {
     await page.keyboard.press("Enter");
     return true;
   }
-
-  // 2) probaj flag za Srbiju
+  // 2) flag (.vti__flag.rs)
   const flag = await page.$(".dropdown-list li.dropdown-item .vti__flag.rs");
   if (flag) { await flag.click(); return true; }
 
-  // 3) scroll + klik po tekstu (Serbia / Serbia (Србија))
+  // 3) skrol + klik po tekstu
   const names = [countryName, "Serbia (Србија)"];
   const clicked = await page.evaluate((names) => {
     const list = document.querySelector(".dropdown-list") || document.body;
@@ -134,7 +129,7 @@ async function extractPageInfo(page) {
   return out;
 }
 
-// --- route ---
+// ---------- ROUTE ----------
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, country = "Serbia" } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ ok:false, error:"Missing fields" });
@@ -149,12 +144,12 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     await page.goto("https://www.avatrade.com/demo-account", { waitUntil: "networkidle2", timeout: 60000 });
     await sleep(1000);
 
-    // 2) cookies/subscribe close (ako ima)
+    // 2) cookies/subscribe close
     try { await clickByTextVisible(page, "button,a", ["Accept","Accept All","I agree","Got it","Not Now","Close"]); } catch {}
 
     // 3) polja
-    await page.waitForSelector("#input-email", { timeout: 25000 });
-    await page.waitForSelector("#input-password", { timeout: 25000 });
+    await page.waitForSelector("#input-email", { timeout: 30000 });
+    await page.waitForSelector("#input-password", { timeout: 30000 });
     await page.click("#input-email", { clickCount: 3 }); await page.type("#input-email", email, { delay: 30 });
     await page.click("#input-password", { clickCount: 3 }); await page.type("#input-password", password, { delay: 30 });
 
@@ -165,23 +160,40 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     if (!picked) throw new Error(`Country '${country}' not selected`);
     await sleep(400);
 
-    // 5) submit (koristi JS click ako običan klik ne može)
-    await page.waitForFunction(() => {
-      const b = document.querySelector(".submit-button button[type='submit']");
-      return b && !b.disabled;
-    }, { timeout: 20000 });
+    // 5) submit – fallbackovi umesto pukog čekanja
+    await page.waitForSelector("button[type='submit']", { timeout: 30000 });
 
-    const clicked = await safeClick(page, ".submit-button button[type='submit']");
-    if (!clicked) {
-      await page.evaluate(() => {
-        const b = document.querySelector(".submit-button button[type='submit']");
-        if (b) b.click();
-      });
+    // trigger validacija (blur/input)
+    await page.evaluate(() => {
+      const e = document.querySelector("#input-email");
+      const p = document.querySelector("#input-password");
+      for (const el of [e,p]) {
+        if (!el) continue;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.blur();
+      }
+    });
+    await sleep(600);
+
+    // ako je disabled, probaj uklanjanje atributa (nekad ostane zapelo)
+    const disabledBefore = await page.$eval("button[type='submit']", b => !!b.disabled).catch(() => true);
+    if (disabledBefore) {
+      await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.removeAttribute("disabled"); });
+      await sleep(200);
     }
 
-    await sleep(7000);
+    // klik
+    const clicked = await safeClick(page, "button[type='submit']");
+    if (!clicked) await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.click(); });
 
-    // 6) info za debug + eventualni MT podaci
+    // čekaj reakciju (navigation ili promenu DOM-a), ali nemoj pucati ako je sporije
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
+      sleep(8000)
+    ]);
+
+    // 6) info
     const mt = await extractPageInfo(page);
     try { await page.screenshot({ path: "after_submit.png", fullPage: true }); } catch {}
 
