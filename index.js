@@ -1,4 +1,4 @@
-// index.js — AvaTrade demo signup (robust clicks + country select + submit fallbacks)
+// index.js — AvaTrade demo signup (debug phases + JS-only clicks)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -10,6 +10,7 @@ const SHARED_SECRET = process.env.PUPPETEER_SHARED_SECRET || "superSecret123";
 const PORT = process.env.PORT || 3000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (...a) => console.log(...a);
 
 function checkAuth(req, res, next) {
   if (req.headers["x-auth"] !== SHARED_SECRET) {
@@ -26,80 +27,85 @@ async function launchBrowser() {
   });
 }
 
-// ---------- HELPERI ----------
-async function safeClick(page, selector) {
-  const el = await page.$(selector);
-  if (!el) return false;
-  try {
-    await el.evaluate((e) => e.scrollIntoView({ block: "center", inline: "center" }));
-  } catch {}
-  try {
-    await el.click({ delay: 40 });
+// ---------- helpers ----------
+async function clickJS(page, selector) {
+  const ok = await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const evs = ["pointerdown", "mousedown", "click", "pointerup", "mouseup"];
+    for (const t of evs) el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
     return true;
-  } catch {
-    try {
-      await page.evaluate((e) => e && e.click(), el);
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  }, selector);
+  return !!ok;
 }
 
-async function clickByTextVisible(page, selector, texts) {
-  return await page.evaluate(({ selector, texts }) => {
-    const lows = texts.map((t) => t.toLowerCase());
-    const els = Array.from(document.querySelectorAll(selector));
-    const el = els.find((e) => {
-      const txt = ((e.textContent || e.getAttribute("placeholder") || "") + "").toLowerCase().trim();
-      const vis = !!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
-      return vis && lows.some((t) => txt.includes(t));
-    });
-    if (el) { el.click(); return true; }
-    return false;
-  }, { selector, texts });
+async function typeJS(page, selector, value) {
+  return await page.evaluate((sel, val) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    el.focus();
+    el.value = "";
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.value = val;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }, selector, value);
 }
 
 async function openCountryDropdown(page) {
+  // više pokušaja
   const tries = [
     ".country-wrapper .vue-country-select .dropdown",
-    ".country-wrapper .vue-country-select input",
+    ".country-wrapper .vue-country-select",
     "input[placeholder='Choose a country']",
     ".country-wrapper .selected-flag",
-    ".country-wrapper",
+    ".country-wrapper"
   ];
   for (const sel of tries) {
-    if (await safeClick(page, sel)) {
-      await sleep(300);
-      if (await page.$(".dropdown-list")) return true;
+    if (await clickJS(page, sel)) {
+      await sleep(400);
+      const opened = await page.$(".dropdown-list");
+      if (opened) return true;
     }
   }
-  await clickByTextVisible(page, "button,div,span,input", ["Choose a country","Country","Select country"]);
-  await sleep(300);
+  // probaj preko teksta
+  await page.evaluate(() => {
+    const textHits = ["choose a country","country","select country"];
+    const els = Array.from(document.querySelectorAll("button,div,span,input"));
+    const el = els.find(e => {
+      const t = ((e.textContent || e.placeholder || "") + "").toLowerCase();
+      const vis = !!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
+      return vis && textHits.some(h => t.includes(h));
+    });
+    if (el) el.click();
+  });
+  await sleep(400);
   return !!(await page.$(".dropdown-list"));
 }
 
 async function pickCountry(page, countryName) {
-  // 1) search polje (ako postoji)
+  // 1) search u listi
   const searchSel = ".dropdown-list input[type='search'], .dropdown-list input[role='combobox'], .dropdown-list input[aria-autocomplete='list']";
-  const search = await page.$(searchSel);
-  if (search) {
-    await search.click({ clickCount: 3 }).catch(() => {});
-    await search.type(countryName, { delay: 35 });
+  const hasSearch = await page.$(searchSel);
+  if (hasSearch) {
+    await typeJS(page, searchSel, countryName);
     await page.keyboard.press("Enter");
     return true;
   }
-  // 2) flag (.vti__flag.rs)
-  const flag = await page.$(".dropdown-list li.dropdown-item .vti__flag.rs");
-  if (flag) { await flag.click(); return true; }
-
+  // 2) flag za Srbiju
+  if (await page.$(".dropdown-list li.dropdown-item .vti__flag.rs")) {
+    await clickJS(page, ".dropdown-list li.dropdown-item .vti__flag.rs");
+    return true;
+  }
   // 3) skrol + klik po tekstu
   const names = [countryName, "Serbia (Србија)"];
-  const clicked = await page.evaluate((names) => {
+  const ok = await page.evaluate((names) => {
     const list = document.querySelector(".dropdown-list") || document.body;
-    function visible(el){ return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length)); }
-    for (let pass = 0; pass < 60; pass++) {
-      const items = Array.from(list.querySelectorAll("li.dropdown-item, li, div.dropdown-item")).filter(visible);
+    function vis(el){ return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length)); }
+    for (let p=0; p<80; p++) {
+      const items = Array.from(list.querySelectorAll("li.dropdown-item, li, div.dropdown-item")).filter(vis);
       const target = items.find(it => {
         const txt = (it.textContent || "").trim().toLowerCase();
         return names.some(n => txt.includes(n.toLowerCase()));
@@ -109,7 +115,7 @@ async function pickCountry(page, countryName) {
     }
     return false;
   }, names);
-  return clicked;
+  return !!ok;
 }
 
 async function extractPageInfo(page) {
@@ -129,41 +135,55 @@ async function extractPageInfo(page) {
   return out;
 }
 
-// ---------- ROUTE ----------
+// ---------- route ----------
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, country = "Serbia" } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ ok:false, error:"Missing fields" });
 
-  let browser;
+  let browser, phase = "init";
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
+    await page.setDefaultTimeout(45000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) demo forma
+    phase = "goto";
+    log("PHASE:", phase);
     await page.goto("https://www.avatrade.com/demo-account", { waitUntil: "networkidle2", timeout: 60000 });
-    await sleep(1000);
+    await sleep(800);
 
-    // 2) cookies/subscribe close
-    try { await clickByTextVisible(page, "button,a", ["Accept","Accept All","I agree","Got it","Not Now","Close"]); } catch {}
+    phase = "cookies";
+    log("PHASE:", phase);
+    await page.evaluate(() => {
+      const texts = ["accept","accept all","i agree","got it","not now","close"];
+      const els = Array.from(document.querySelectorAll("button,a"));
+      const el = els.find(e => {
+        const t = (e.textContent || "").toLowerCase();
+        return texts.some(x => t.includes(x));
+      });
+      if (el) el.click();
+    });
 
-    // 3) polja
-    await page.waitForSelector("#input-email", { timeout: 30000 });
-    await page.waitForSelector("#input-password", { timeout: 30000 });
-    await page.click("#input-email", { clickCount: 3 }); await page.type("#input-email", email, { delay: 30 });
-    await page.click("#input-password", { clickCount: 3 }); await page.type("#input-password", password, { delay: 30 });
+    phase = "fill";
+    log("PHASE:", phase);
+    await page.waitForSelector("#input-email");
+    await page.waitForSelector("#input-password");
+    await typeJS(page, "#input-email", email);
+    await typeJS(page, "#input-password", password);
 
-    // 4) country
+    phase = "country-open";
+    log("PHASE:", phase);
     const opened = await openCountryDropdown(page);
     if (!opened) throw new Error("Country dropdown not opened");
+
+    phase = "country-pick";
+    log("PHASE:", phase);
     const picked = await pickCountry(page, country);
     if (!picked) throw new Error(`Country '${country}' not selected`);
-    await sleep(400);
+    await sleep(300);
 
-    // 5) submit – fallbackovi umesto pukog čekanja
-    await page.waitForSelector("button[type='submit']", { timeout: 30000 });
-
-    // trigger validacija (blur/input)
+    phase = "submit";
+    log("PHASE:", phase);
     await page.evaluate(() => {
       const e = document.querySelector("#input-email");
       const p = document.querySelector("#input-password");
@@ -174,26 +194,17 @@ app.post("/create-demo", checkAuth, async (req, res) => {
         el.blur();
       }
     });
-    await sleep(600);
-
-    // ako je disabled, probaj uklanjanje atributa (nekad ostane zapelo)
-    const disabledBefore = await page.$eval("button[type='submit']", b => !!b.disabled).catch(() => true);
-    if (disabledBefore) {
-      await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.removeAttribute("disabled"); });
-      await sleep(200);
-    }
-
-    // klik
-    const clicked = await safeClick(page, "button[type='submit']");
-    if (!clicked) await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.click(); });
-
-    // čekaj reakciju (navigation ili promenu DOM-a), ali nemoj pucati ako je sporije
+    await sleep(400);
+    // oslobodi dugme i klikni JS-om
+    await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.removeAttribute("disabled"); });
+    await clickJS(page, "button[type='submit']");
     await Promise.race([
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }).catch(() => {}),
       sleep(8000)
     ]);
 
-    // 6) info
+    phase = "extract";
+    log("PHASE:", phase);
     const mt = await extractPageInfo(page);
     try { await page.screenshot({ path: "after_submit.png", fullPage: true }); } catch {}
 
@@ -206,9 +217,10 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       mt_password: mt.password || password,
       page_excerpt: mt.excerpt,
     });
+
   } catch (e) {
-    console.error("create-demo error:", e?.message || e);
-    return res.status(500).json({ ok:false, error: String(e) });
+    console.error("create-demo error:", e?.message || e, "AT PHASE:", phase);
+    return res.status(500).json({ ok:false, error: String(e), phase });
   } finally {
     try { if (browser) await browser.close(); } catch {}
   }
