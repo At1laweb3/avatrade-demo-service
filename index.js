@@ -7,6 +7,9 @@ app.use(express.json());
 const SHARED_SECRET = process.env.PUPPETEER_SHARED_SECRET;
 const PORT = process.env.PORT || 3000;
 
+// simple sleep umesto page.waitForTimeout
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function checkAuth(req, res, next) {
   if (req.headers["x-auth"] !== SHARED_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
@@ -52,9 +55,9 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     const page = await browser.newPage();
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) open home (čekamo malo duže da se učita header)
+    // 1) home
     await page.goto("https://www.avatrade.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(1500);
+    await sleep(1500);
 
     // 2) cookie/subscribe bar
     try {
@@ -62,12 +65,11 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       if (!ok) ok = await clickByTextVisible(page, "button,a", ["Not Now", "Close"]);
     } catch {}
 
-    // 3) pokušaj 1: klik po tekstu “Free Demo”
+    // 3) Free Demo (više fallbacka)
     let clicked = await clickByTextVisible(page, "a,button,div,span", [
       "Free Demo", "Free demo", "FREE DEMO", "Free Demo Account", "Demo account"
     ]);
 
-    // 3b) pokušaj 2: po href-u (link koji sadrži 'demo')
     if (!clicked) {
       clicked = await page.evaluate(() => {
         const all = Array.from(document.querySelectorAll("a,button"));
@@ -87,29 +89,27 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       throw new Error("Free Demo button not found");
     }
 
-    // 4) čekaj da se modal pojavi i polja budu spremna
-    // probamo najpre po placeholder-ima, zatim fallback na tip/name
-    await page.waitForTimeout(600);
+    // 4) modal forma
+    await sleep(600);
     const emailSel = "input[placeholder='Email'], input[type='email'], input[name*='email' i]";
     const passSel  = "input[placeholder='Password'], input[type='password'], input[name*='password' i]";
 
     await typeInto(page, emailSel, email);
     await typeInto(page, passSel, password);
 
-    // 5) country dropdown
+    // 5) country
     let opened = await clickByTextVisible(page, "div,span,button", ["Choose a country", "Country", "Select country"]);
     if (!opened) {
       const cInput = await page.$("input[placeholder*='Country' i], input[role='combobox'], input[type='search']");
       if (cInput) await cInput.click();
     }
-    await page.waitForTimeout(400);
+    await sleep(400);
 
     const searchBox = await page.$("input[type='search'], input[role='combobox'], input[aria-autocomplete='list']");
     if (searchBox) {
       await searchBox.type(country, { delay: 35 });
       await page.keyboard.press("Enter");
     } else {
-      // fallback: pokušaj direktan klik na item sa imenom države
       await clickByTextVisible(page, "*", [country]);
     }
 
@@ -120,8 +120,8 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       throw new Error("Submit button not found");
     }
 
-    // 7) pričekaj da server obradi (kasnije dodajemo MT info scraping)
-    await page.waitForTimeout(7000);
+    // 7) pričekaj obradu (kasnije: MT info scraping)
+    await sleep(7000);
     res.json({ ok: true, note: "Submit ok. MT info scraping TBD." });
 
   } catch (e) {
