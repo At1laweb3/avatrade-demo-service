@@ -1,4 +1,4 @@
-// index.js — AvaTrade DEMO + MT4 (CF wall bypass + myvip login + screenshots)
+// index.js — AvaTrade DEMO + MT4 (CF hard-block fallback + myvip login + screenshots)
 import express from "express";
 import puppeteer from "puppeteer";
 import path from "path";
@@ -33,11 +33,7 @@ async function launchBrowser() {
 async function snap(page, label, shots, full=false){
   if(!DEBUG) return;
   const name = `${ts()}_${label}.png`;
-  try{
-    await page.screenshot({ path:name, fullPage:!!full });
-    shots.push(name);
-    console.log("SNAP:", name);
-  }catch{}
+  try{ await page.screenshot({ path:name, fullPage:!!full }); shots.push(name); console.log("SNAP:", name); }catch{}
 }
 
 async function clickJS(ctx, selector){
@@ -45,19 +41,16 @@ async function clickJS(ctx, selector){
     const el = document.querySelector(sel);
     if(!el) return false;
     el.scrollIntoView({block:"center", inline:"center"});
-    const evts=["pointerdown","mousedown","click","pointerup","mouseup"];
-    for(const t of evts) el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));
+    ["pointerdown","mousedown","click","pointerup","mouseup"].forEach(t=>el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window})));
     return true;
   }, selector);
   return !!ok;
 }
-
 async function typeJS(ctx, selector, value){
   return await ctx.evaluate((sel,val)=>{
     const el = document.querySelector(sel);
     if(!el) return false;
-    el.focus(); el.value="";
-    el.dispatchEvent(new Event("input",{bubbles:true}));
+    el.focus(); el.value=""; el.dispatchEvent(new Event("input",{bubbles:true}));
     el.value = val;
     el.dispatchEvent(new Event("input",{bubbles:true}));
     el.dispatchEvent(new Event("change",{bubbles:true}));
@@ -70,22 +63,13 @@ async function dismissBanners(page){
     const btns = Array.from(document.querySelectorAll("button,a,div[role='button']"));
     const el = btns.find(b=>/accept|got it|agree|allow|close|not now|ok/i.test((b.textContent||"")));
     if(el) el.click();
-
     const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
     if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
     const pop = document.getElementById("solitics-popup-maker");
     if(pop) pop.style.display="none";
-
-    const closeEls = [
-      "[aria-label='Close']",".modal .close",".modal-close",".dy-lb-close",
-      "button[title='Close']", "button:has(svg[aria-label='Close'])"
-    ];
-    for(const sel of closeEls){
-      const e = document.querySelector(sel);
-      if(e){ e.dispatchEvent(new MouseEvent("click",{bubbles:true})); }
-    }
-    const xBtns = Array.from(document.querySelectorAll("button, a, span")).filter(n=>/^\s*×\s*$/.test(n.textContent||""));
-    if(xBtns[0]) xBtns[0].dispatchEvent(new MouseEvent("click",{bubbles:true}));
+    const closeEls = ["[aria-label='Close']",".modal .close",".modal-close",".dy-lb-close","button[title='Close']"];
+    for(const sel of closeEls){ const e=document.querySelector(sel); if(e) e.dispatchEvent(new MouseEvent("click",{bubbles:true})); }
+    const xs = Array.from(document.querySelectorAll("button,a,span")).filter(n=>/^\s*×\s*$/.test(n.textContent||"")); if(xs[0]) xs[0].click();
   });
 }
 
@@ -95,40 +79,41 @@ async function isCloudflareWall(page){
   const text = await page.evaluate(()=>document.body?document.body.innerText:"");
   return /cdn-cgi|cloudflare/i.test(url) ||
          /Verifying you are human/i.test(text) ||
+         /Please unblock challenges\.cloudflare\.com/i.test(text) ||
          /Performance & security by Cloudflare/i.test(text);
 }
-
-// go to url; ako se pojavi CF “verifying…”, napravi backoff + refresh + retry
-async function navigateWithCFBypass(page, url, shots, tag, tries=4){
-  let lastErr = null;
-  for(let i=1;i<=tries;i++){
-    try{
-      await page.setExtraHTTPHeaders({
-        "Accept-Language":"en-US,en;q=0.9,sr-RS;q=0.8",
-        "Upgrade-Insecure-Requests":"1",
-      });
-      await page.goto(url, { waitUntil:"domcontentloaded", timeout:90000 });
-      await dismissBanners(page);
-      await snap(page, `${tag}_nav_${i}`, shots, true);
-
-      if(await isCloudflareWall(page)){
-        await snap(page, `${tag}_cf_${i}`, shots, true);
-        // izađi sa strane, sačekaj, pa nazad
-        await page.goto("about:blank");
-        await sleep(1200 + Math.floor(Math.random()*1200));
-        continue; // retry isti url
-      }
-      return; // uspešno
-    }catch(e){
-      lastErr = e;
-      await sleep(1200);
-    }
-  }
-  if(lastErr) throw lastErr;
-  throw new Error("Cloudflare wall loop at: " + url);
+async function isCloudflareHardBlocked(page){
+  const text = await page.evaluate(()=>document.body?document.body.innerText:"");
+  return /Please unblock challenges\.cloudflare\.com/i.test(text);
 }
 
-// ---------- generic waits ----------
+// go to url; ako je CF “verifying…”, probaj ponovo; ako je “Please unblock…”, vrati CF_HARD
+async function navigateWithCFBypass(page, url, shots, tag, tries=4){
+  for(let i=1;i<=tries;i++){
+    await page.setExtraHTTPHeaders({
+      "Accept-Language":"en-US,en;q=0.9,sr-RS;q=0.8",
+      "Upgrade-Insecure-Requests":"1",
+    });
+    await page.goto(url, { waitUntil:"domcontentloaded", timeout:90000 }).catch(()=>{});
+    await dismissBanners(page);
+    await snap(page, `${tag}_nav_${i}`, shots, true);
+
+    if(await isCloudflareHardBlocked(page)){
+      await snap(page, `${tag}_cf_hard_${i}`, shots, true);
+      return { ok:false, hard:true };
+    }
+    if(await isCloudflareWall(page)){
+      await snap(page, `${tag}_cf_${i}`, shots, true);
+      await page.goto("about:blank").catch(()=>{});
+      await sleep(1200 + Math.floor(Math.random()*1200));
+      continue; // retry
+    }
+    return { ok:true, hard:false };
+  }
+  return { ok:false, hard:false };
+}
+
+// ---------- waits ----------
 async function waitForAny(page, selectors, totalMs=60000){
   const start = Date.now();
   while(Date.now()-start < totalMs){
@@ -160,16 +145,9 @@ function splitIntl(phone){
 }
 async function setPhoneDialCountry(page, countryName){
   const openTries = [".iti__flag-container",".vti__dropdown",".vti__selection",".phone-wrapper .dropdown",".phone-wrapper"];
-  for(const sel of openTries){
-    if(await page.$(sel)){ await clickJS(page, sel); await sleep(300); break; }
-  }
+  for(const sel of openTries){ if(await page.$(sel)){ await clickJS(page, sel); await sleep(300); break; } }
   const picked = await page.evaluate((name)=>{
-    const lists = [
-      document.querySelector(".iti__country-list"),
-      document.querySelector(".vti__dropdown-list"),
-      document.querySelector(".dropdown-menu"),
-      document.querySelector(".dropdown-list")
-    ].filter(Boolean);
+    const lists=[document.querySelector(".iti__country-list"),document.querySelector(".vti__dropdown-list"),document.querySelector(".dropdown-menu"),document.querySelector(".dropdown-list")].filter(Boolean);
     for(const list of lists){
       const items = Array.from(list.querySelectorAll("li,div")).filter(el=>/serbia|србија/i.test(el.textContent||""));
       if(items[0]){ items[0].dispatchEvent(new MouseEvent("click",{bubbles:true})); return true; }
@@ -233,11 +211,9 @@ async function smartGotoDemo(page, shots){
   ];
   for(const u of urls){
     log("PHASE: goto ->", u);
-    try{
-      await navigateWithCFBypass(page, u, shots, "demo");
-    }catch{
-      continue; // probaj sledeći URL
-    }
+    const nav = await navigateWithCFBypass(page, u, shots, "demo");
+    if(nav.hard) throw new Error("CF_HARD_BLOCK");
+    if(!nav.ok) continue;
     await dismissBanners(page);
     await snap(page, "01_goto", shots, true);
 
@@ -265,7 +241,7 @@ app.post("/create-demo", async (req, res) => {
   const normPhone = normalizePhone(phone, defaultCc);
   const { rest } = splitIntl(normPhone);
 
-  let browser, phase="init";
+  let browser, phase="init", assumeSuccess=false;
   const shots=[];
 
   try{
@@ -281,67 +257,90 @@ app.post("/create-demo", async (req, res) => {
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
+    // 1) otvori demo formu
     phase="goto";
-    const { emailSel, passSel } = await smartGotoDemo(page, shots);
-
-    phase="fill";
-    await typeJS(page, emailSel, email);
-    await typeJS(page, passSel, password);
-
-    await setPhoneDialCountry(page, country);
-    await typePhoneWithKeyboard(page, rest);
-    await snap(page,"02_filled",shots);
-
-    phase="submit";
-    await page.evaluate((eSel,pSel)=>{
-      const e=document.querySelector(eSel);
-      const p=document.querySelector(pSel);
-      for(const el of [e,p]){
-        if(!el) continue;
-        el.dispatchEvent(new Event("input",{bubbles:true}));
-        el.dispatchEvent(new Event("change",{bubbles:true}));
-        el.blur();
+    let emailSel, passSel;
+    try{
+      const r = await smartGotoDemo(page, shots);
+      emailSel = r.emailSel; passSel = r.passSel;
+    }catch(err){
+      // CF hard-block → pretpostavi uspeh posle maksimalno 30s
+      if(String(err).includes("CF_HARD_BLOCK")){
+        assumeSuccess = true;
+        await snap(page,"demo_cf_hard_block", shots, true);
+      }else{
+        throw err;
       }
-      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(b=>/submit|sign up|start/i.test(b.textContent||""));
-      if(b) b.removeAttribute("disabled");
-    }, emailSel, passSel);
-
-    await dismissBanners(page);
-    await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
-    await Promise.race([
-      page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
-      sleep(9000)
-    ]);
-    // ako nas odmah prebaci na CF, rerun trenutnu URL
-    if(await isCloudflareWall(page)){
-      await snap(page,"04_cf_after_submit",shots,true);
-      await navigateWithCFBypass(page, page.url(), shots, "demo_after_submit");
     }
-    await snap(page,"04_after_submit",shots,true);
 
-    const textNow = await page.evaluate(()=>document.body?.innerText || "");
-    if (/Your Demo Account is Being Created/i.test(textNow)) await snap(page, "04b_being_created", shots, true);
+    if(!assumeSuccess){
+      // 2) popuni i submit
+      phase="fill";
+      await typeJS(page, emailSel, email);
+      await typeJS(page, passSel, password);
+      await setPhoneDialCountry(page, country);
+      await typePhoneWithKeyboard(page, rest);
+      await snap(page,"02_filled",shots);
 
-    phase="outcome";
-    const outcome = await waitForOutcome(page, 60000);
-    await snap(page, `05_outcome_${outcome.status}`, shots);
+      phase="submit";
+      await page.evaluate((eSel,pSel)=>{
+        const e=document.querySelector(eSel), p=document.querySelector(pSel);
+        for(const el of [e,p]){ if(!el) continue; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); el.blur(); }
+        const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(b=>/submit|sign up|start/i.test(b.textContent||""));
+        if(b) b.removeAttribute("disabled");
+      }, emailSel, passSel);
 
-    phase="extract";
+      await dismissBanners(page);
+      await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
+      await Promise.race([
+        page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
+        sleep(9000)
+      ]);
+
+      if(await isCloudflareHardBlocked(page)){
+        await snap(page,"04_cf_hard_after_submit",shots,true);
+        assumeSuccess = true;
+      }else{
+        await snap(page,"04_after_submit",shots,true);
+        const textNow = await page.evaluate(()=>document.body?.innerText || "");
+        if (/Your Demo Account is Being Created/i.test(textNow)) await snap(page, "04b_being_created", shots, true);
+
+        phase="outcome";
+        const outcome = await waitForOutcome(page, 60000);
+        await snap(page, `05_outcome_${outcome.status}`, shots);
+        if(outcome.status!=="success"){
+          // i ovo tretiramo kao OK (traženo ponašanje) – idemo dalje
+          assumeSuccess = true;
+        }
+      }
+    }
+
+    // 3) ako je bilo CF bloka ili nismo dobili jasan success → sačekaj do 30s i vrati OK
+    if(assumeSuccess){
+      await sleep(30000); // max 30s čekanja
+      const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
+      const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
+      return res.json({
+        ok: true,
+        note: "assumed_success_after_wait",
+        url: "https://www.avatrade.com/demo-account",
+        outcome_excerpt: "CF hard/uncertain — assumed OK after wait",
+        mt_login: null, mt_server: null, mt_password: password, page_excerpt: "",
+        screenshots: screenshot_urls
+      });
+    }
+
+    // ako je bio stvarni success, gore smo ga već snimili
     const mt = await extractPageInfo(page);
-
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
     const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
-
     return res.json({
-      ok: outcome.status === "success",
-      note: `Outcome: ${outcome.status}`,
+      ok: true,
+      note: "Outcome: success",
       url: page.url(),
-      outcome_excerpt: outcome.text?.slice(0,500) || "",
-      mt_login: mt.login,
-      mt_server: mt.server,
-      mt_password: mt.password || password,
-      page_excerpt: mt.excerpt,
-      screenshots: screenshot_urls
+      outcome_excerpt: "",
+      mt_login: mt.login, mt_server: mt.server, mt_password: mt.password || password,
+      page_excerpt: mt.excerpt, screenshots: screenshot_urls
     });
 
   }catch(e){
@@ -425,9 +424,10 @@ app.post("/create-mt4", async (req, res)=>{
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) MyVIP login (CF bypass)
+    // 1) MyVIP login (CF bypass + retry)
     phase="myvip-login"; log("PHASE:", phase);
-    await navigateWithCFBypass(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip");
+    const mv = await navigateWithCFBypass(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip", 4);
+    if(mv.hard) return res.status(500).json({ ok:false, error:"CF hard-block on myvip", phase, screenshots: [] });
     await dismissBanners(page);
     await snap(page,"mt4_00_myvip", shots, true);
 
@@ -442,27 +442,14 @@ app.post("/create-mt4", async (req, res)=>{
         page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{}),
         sleep(8000),
       ]);
-      if(await isCloudflareWall(page)){
-        await snap(page,"mt4_00c_cf_after_login", shots, true);
-        await navigateWithCFBypass(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_retry");
-        // ponovo popuni
-        const emSel = await waitForAny(page, ["input[type='email']","#email","input[name='email']"], 30000);
-        const pwSel = await waitForAny(page, ["input[type='password']","#password","input[name='password']"], 30000);
-        await typeJS(page, emSel, email);
-        await typeJS(page, pwSel, password);
-        await clickJS(page, "button[type='submit'], .btn-primary, button");
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{}),
-          sleep(8000),
-        ]);
-      }
-      await dismissBanners(page);
-      await snap(page,"mt4_00d_myvip_after_login", shots, true);
     }
+    await dismissBanners(page);
+    await snap(page,"mt4_00d_myvip_after_login", shots, true);
 
-    // 2) CRM accounts (CF bypass)
+    // 2) CRM accounts
     phase="goto-accounts"; log("PHASE:", phase);
-    await navigateWithCFBypass(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts");
+    const ac = await navigateWithCFBypass(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts", 4);
+    if(ac.hard) return res.status(500).json({ ok:false, error:"CF hard-block on accounts", phase, screenshots: [] });
     await dismissBanners(page);
     await snap(page,"mt4_01_accounts", shots, true);
 
@@ -524,5 +511,4 @@ app.use("/shots", (req,res)=>{
   if(!fs.existsSync(full)) return res.status(404).send("not found");
   res.sendFile(full);
 });
-
 app.listen(PORT, ()=>console.log("Listening on", PORT));
