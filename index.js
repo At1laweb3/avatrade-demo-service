@@ -1,7 +1,6 @@
-// index.js — AvaTrade demo + MT4 kreiranje (iframe flow)
-// - /create-demo  (kao ranije)
-// - /create-mt4   (otvara CRM -> hover "Add an Account" -> "Demo Account" -> CFD-MT4 + EUR -> Submit)
-// - DEBUG_SCREENSHOTS=1 pravi screenshotove i loguje "SNAP: <file.png>"
+// index.js — AvaTrade demo + MT4 kreiranje (otpornije varijante + screenshots u logu)
+// DEBUG_SCREENSHOTS=1 -> pravi PNG-ove i ispisuje "SNAP: <naziv>"
+// Rute: /create-demo i /create-mt4
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -18,34 +17,21 @@ const DEBUG = process.env.DEBUG_SCREENSHOTS === "1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(...a);
 
-function checkAuth(req, res, next) {
-  if (req.headers["x-auth"] !== SHARED_SECRET) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  next();
-}
+function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19); }
 
 // ---------- LAUNCH ----------
 async function launchBrowser() {
   return await puppeteer.launch({
     headless: "new",
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-zygote",
-      "--window-size=1280,1000",
-      "--renderer-process-limit=1",
-      "--js-flags=--max-old-space-size=256",
-      "--no-first-run",
-      "--no-default-browser-check",
+      "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+      "--disable-gpu","--no-zygote","--window-size=1280,1000",
+      "--renderer-process-limit=1","--js-flags=--max-old-space-size=256",
+      "--no-first-run","--no-default-browser-check",
     ],
     defaultViewport: { width: 1280, height: 1000 },
   });
 }
-
-function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19); }
 
 async function snap(page, label, shots, full=false){
   if(!DEBUG) return;
@@ -54,11 +40,11 @@ async function snap(page, label, shots, full=false){
     await page.screenshot({ path:name, fullPage:!!full });
     shots.push(name);
     console.log("SNAP:", name);
-  }catch(e){}
+  }catch{}
 }
 
-async function clickJS(pageOrFrame, selector){
-  const ok = await pageOrFrame.evaluate((sel)=>{
+async function clickJS(ctx, selector){
+  const ok = await ctx.evaluate((sel)=>{
     const el = document.querySelector(sel);
     if(!el) return false;
     el.scrollIntoView({block:"center", inline:"center"});
@@ -69,8 +55,8 @@ async function clickJS(pageOrFrame, selector){
   return !!ok;
 }
 
-async function typeJS(pageOrFrame, selector, value){
-  return await pageOrFrame.evaluate((sel,val)=>{
+async function typeJS(ctx, selector, value){
+  return await ctx.evaluate((sel,val)=>{
     const el = document.querySelector(sel);
     if(!el) return false;
     el.focus(); el.value="";
@@ -84,10 +70,35 @@ async function typeJS(pageOrFrame, selector, value){
 
 async function dismissBanners(page){
   await page.evaluate(()=>{
+    // generična dugmad
     const btns = Array.from(document.querySelectorAll("button,a,div[role='button']"));
-    const el = btns.find(b=>/accept|got it|agree|close|not now|ok/i.test((b.textContent||"")));
+    const el = btns.find(b=>/accept|got it|agree|allow|close|not now|ok/i.test((b.textContent||"")));
     if(el) el.click();
+
+    // Solitics modal (X dugme)
+    const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
+    if(x) (x).dispatchEvent(new MouseEvent("click",{bubbles:true}));
+    // ako i dalje stoji — skloni ga na silu
+    const pop = document.getElementById("solitics-popup-maker");
+    if(pop) pop.style.display="none";
   });
+}
+
+// helper: čekaj bilo koji selektor iz liste (vidljiv)
+async function waitForAny(page, selectors, totalMs=60000){
+  const start = Date.now();
+  while(Date.now()-start < totalMs){
+    for(const sel of selectors){
+      const el = await page.$(sel);
+      if(el){
+        // proveri vidljivost
+        const vis = await page.evaluate(e => !!(e.offsetParent || (e.getClientRects && e.getClientRects().length)), el);
+        if(vis) return sel;
+      }
+    }
+    await sleep(400);
+  }
+  throw new Error("none of selectors appeared: " + selectors.join(" | "));
 }
 
 // ==== country helpers (create-demo) ====
@@ -189,10 +200,7 @@ async function typePhoneWithKeyboard(page, localDigits){
   for(const sel of sels){
     if(await page.$(sel)){
       await page.click(sel, { clickCount: 3 });
-      const isMac = await page.evaluate(()=>navigator.platform.includes("Mac"));
-      if(isMac){ await page.keyboard.down("Meta"); } else { await page.keyboard.down("Control"); }
-      await page.keyboard.press("KeyA");
-      if(isMac){ await page.keyboard.up("Meta"); } else { await page.keyboard.up("Control"); }
+      await page.keyboard.down("Control"); await page.keyboard.press("KeyA"); await page.keyboard.up("Control");
       await page.keyboard.press("Backspace");
       await page.type(sel, localDigits, { delay: 30 });
       await page.keyboard.press("Tab");
@@ -208,7 +216,7 @@ async function extractPageInfo(page){
   const excerpt = (text||"").replace(/\s+/g," ").slice(0,2000);
   const out = { found:false, login:null, server:null, password:null, excerpt };
   if(!text) return out;
-  const login  = text.match(/(?:MT[45]\s*login|Your .* login credentials.*?Login)\s*[:\-]?\s*(\d{6,12})/i);
+  const login  = text.match(/(?:MT[45]\s*login|Your .* login credentials.*?Login|Login)\s*[:\-]?\s*(\d{6,12})/i);
   const server = text.match(/Server\s*[:\-]?\s*([A-Za-z0-9._\-\s]+?(?:Demo|Live)?)/i);
   const pass   = text.match(/Password\s*[:\-]?\s*([^\s\r\n]+)/i);
   if(login)  out.login  = login[1];
@@ -233,6 +241,33 @@ async function waitForOutcome(page, maxMs=60000){
   return {status:"timeout", text:last.slice(0,2000)};
 }
 
+// smartGoto – proba više varijanti stranice sa formom
+async function smartGotoDemo(page, shots){
+  const urls = [
+    "https://www.avatrade.com/demo-account",
+    "https://www.avatrade.com/trading-account/demo-trading-account",
+  ];
+  for(const u of urls){
+    log("PHASE: goto ->", u);
+    await page.goto(u, { waitUntil:"domcontentloaded", timeout:90000 });
+    await dismissBanners(page);
+    await snap(page, "01_goto", shots, true);
+
+    // pokušaj odmah da nađeš email/password
+    const emailCandidates = ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"];
+    const passCandidates  = ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"];
+
+    try{
+      const emailSel = await waitForAny(page, emailCandidates, 8000);
+      const passSel  = await waitForAny(page, passCandidates, 8000);
+      return { emailSel, passSel };
+    }catch{
+      // ništa — probaćemo sledeći URL
+    }
+  }
+  throw new Error("Demo form not found on known URLs");
+}
+
 // ===== /create-demo =====
 app.post("/create-demo", async (req, res) => {
   if (req.headers["x-auth"] !== SHARED_SECRET) return res.status(401).json({ ok:false, error:"Unauthorized" });
@@ -252,65 +287,60 @@ app.post("/create-demo", async (req, res) => {
     browser = await launchBrowser();
     const page = await browser.newPage();
 
-    // ne diramo JS/CSS za React stranice; abort samo teške/ads
     await page.setRequestInterception(true);
     page.on("request", req => {
-      const u = req.url();
-      const t = req.resourceType();
-      if (t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) {
-        req.abort();
-      } else { req.continue(); }
+      const u = req.url(); const t=req.resourceType();
+      if (t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
+      else req.continue();
     });
-
-    await page.setDefaultTimeout(60000);
+    await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    log("PHASE: goto");
-    await page.goto("https://www.avatrade.com/demo-account", { waitUntil:"domcontentloaded", timeout:60000 });
-    await snap(page,"01_goto",shots,true);
-    await dismissBanners(page);
-    await sleep(500);
+    // otvori demo formu (više varijanti)
+    phase="goto";
+    const { emailSel, passSel } = await smartGotoDemo(page, shots);
 
-    log("PHASE: fill");
-    await page.waitForSelector("#input-email");
-    await page.waitForSelector("#input-password");
-    await typeJS(page, "#input-email", email);
-    await typeJS(page, "#input-password", password);
+    phase="fill";
+    await typeJS(page, emailSel, email);
+    await typeJS(page, passSel, password);
 
     await setPhoneDialCountry(page, country);
     await typePhoneWithKeyboard(page, rest);
     await snap(page,"02_filled",shots);
 
-    log("PHASE: country");
+    phase="country";
     if(await openCountryDropdown(page)) await pickCountry(page, country);
     await snap(page,"03_country",shots);
 
-    log("PHASE: submit");
-    await page.evaluate(()=>{
-      const e=document.querySelector("#input-email");
-      const p=document.querySelector("#input-password");
+    phase="submit";
+    await page.evaluate((eSel,pSel)=>{
+      const e=document.querySelector(eSel);
+      const p=document.querySelector(pSel);
       for(const el of [e,p]){
         if(!el) continue;
         el.dispatchEvent(new Event("input",{bubbles:true}));
         el.dispatchEvent(new Event("change",{bubbles:true}));
         el.blur();
       }
-    });
+      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(b=>/submit|sign up|start/i.test(b.textContent||""));
+      if(b) b.removeAttribute("disabled");
+    }, emailSel, passSel);
+
     await dismissBanners(page);
     await sleep(400);
-    await page.evaluate(()=>{ const b=document.querySelector("button[type='submit']"); if(b) b.removeAttribute("disabled"); });
-    await clickJS(page, "button[type='submit']");
+    // klik Submit
+    const clicked = await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
     await Promise.race([
       page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
       sleep(9000)
     ]);
-    await snap(page,"04_after_submit",shots);
+    await snap(page,"04_after_submit",shots,true);
 
-    log("PHASE: outcome");
+    phase="outcome";
     const outcome = await waitForOutcome(page, 60000);
     await snap(page, `05_outcome_${outcome.status}`, shots);
 
-    log("PHASE: extract");
+    phase="extract";
     const mt = await extractPageInfo(page);
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
@@ -338,13 +368,11 @@ app.post("/create-demo", async (req, res) => {
 
 // ===== helpers za MT4 (CRM/iframe) =====
 async function getMyAccountFrame(page){
-  // čekaj da React montira iframe
   const handle = await page.waitForSelector('#my_account, iframe[src*="avacrm"]', { timeout: 90000 });
   const frame = await handle.contentFrame();
   if(!frame) throw new Error("iframe content not available");
   return frame;
 }
-
 async function clickByText(frame, tagList, regex, hoverOnly=false){
   return await frame.evaluate((tags, pattern, hover)=>{
     const rx = new RegExp(pattern, "i");
@@ -366,9 +394,7 @@ async function clickByText(frame, tagList, regex, hoverOnly=false){
     }
   }, tagList, regex.source, hoverOnly);
 }
-
 async function selectOptionByText(frame, optionText){
-  // pokušaj <select> prvo
   const okSelect = await frame.evaluate((wanted)=>{
     const sels = Array.from(document.querySelectorAll("select"));
     for(const s of sels){
@@ -378,8 +404,6 @@ async function selectOptionByText(frame, optionText){
     return false;
   }, optionText);
   if(okSelect) return true;
-
-  // custom dropdown: otvori bilo koji toggle u viewportu, klikni stavku sa tekstom
   await frame.evaluate(()=>{
     const toggles = Array.from(document.querySelectorAll("[role='combobox'], .Select-control, .dropdown, .select, .v-select, .css-1hwfws3"));
     const t = toggles.find(x=>!!(x.offsetParent || (x.getClientRects && x.getClientRects().length)));
@@ -417,29 +441,24 @@ app.post("/create-mt4", async (req, res)=>{
 
     phase="goto-accounts"; log("PHASE:", phase);
     await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
-    await snap(page,"mt4_01_accounts", shots, true);
     await dismissBanners(page);
+    await snap(page,"mt4_01_accounts", shots, true);
 
     // Ako nema iframea -> login
     phase="maybe-login";
     const hasIframe = await page.$('#my_account, iframe[src*="avacrm"]');
     if(!hasIframe){
-      // nađu se email/password
-      const emailSel = "input[type='email'], input[name='email'], #email";
-      const passSel  = "input[type='password'], input[name='password'], #password";
-      const btnSel   = "button[type='submit'], button, .btn";
-      await page.waitForSelector(emailSel, { timeout: 60000 });
+      const emailSel = await waitForAny(page, ["input[type='email']","input[name='email']","#email"], 60000);
+      const passSel  = await waitForAny(page, ["input[type='password']","input[name='password']","#password"], 60000);
       await typeJS(page, emailSel, email);
       await typeJS(page, passSel, password);
       await snap(page,"mt4_02_login_filled",shots);
-      await clickJS(page, btnSel);
+      await clickJS(page, "button[type='submit'], .btn, button");
       await Promise.race([
         page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:60000 }).catch(()=>{}),
         sleep(8000),
       ]);
       await snap(page,"mt4_03_after_login",shots,true);
-
-      // osveži na target stranicu
       await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
       await snap(page,"mt4_04_accounts_again",shots,true);
     }
@@ -452,21 +471,18 @@ app.post("/create-mt4", async (req, res)=>{
     phase="hover-add"; log("PHASE:", phase);
     const hovered = await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, true);
     await snap(page,"mt4_06_hover_add",shots);
-    // fallback: i klik
     if(!hovered) await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, false);
     await sleep(500);
 
     // 2) klik Demo Account
     phase="click-demo"; log("PHASE:", phase);
-    const demoClicked = await clickByText(frame, ["button","a","div","span"], /Demo Account/i, false);
+    await clickByText(frame, ["button","a","div","span"], /Demo Account/i, false);
     await snap(page,"mt4_07_click_demo",shots,true);
 
-    // 3) Add Demo Account ekran -> set CFD - MT4 + EUR
+    // 3) set CFD - MT4 + EUR
     phase="set-dropdowns"; log("PHASE:", phase);
     await frame.waitForSelector("body", { timeout: 90000 });
-    // trading platform
     await selectOptionByText(frame, "CFD - MT4");
-    // base currency
     await selectOptionByText(frame, "EUR");
     await snap(page,"mt4_08_dropdowns_set",shots);
 
@@ -476,16 +492,11 @@ app.post("/create-mt4", async (req, res)=>{
     await sleep(2000);
     await snap(page,"mt4_09_after_submit",shots,true);
 
-    // 5) Wait for credentials and extract
+    // 5) extract
     phase="extract"; log("PHASE:", phase);
-    // ponekad modal/stranica se pojavi u istom iframe-u, zato čitamo iz frame-a
     const credText = await frame.evaluate(()=>document.body?.innerText || "");
-    let login = null;
-    const m = credText.match(/Login\s*:\s*(\d{6,12})/i);
-    if(m) login = m[1];
-
+    let login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
     if(!login){
-      // fallback: pogledaj ceo page
       const mt = await extractPageInfo(page);
       login = mt.login || null;
     }
@@ -494,11 +505,7 @@ app.post("/create-mt4", async (req, res)=>{
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
     const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
 
-    return res.json({
-      ok: !!login,
-      mt4_login: login,
-      screenshots: screenshot_urls
-    });
+    return res.json({ ok: !!login, mt4_login: login, screenshots: screenshot_urls });
 
   }catch(e){
     console.error("create-mt4 error:", e?.message || e, "AT PHASE:", phase);
