@@ -1,7 +1,7 @@
 // index.js — AvaTrade demo signup (telefon: dropdown + tastatura)
 // - email, password, country, phone
 // - tastaturom trigeruje validaciju telefona
-// - screenshotovi (DEBUG_SCREENSHOTS=1)
+// - screenshotovi (DEBUG_SCREENSHOTS=1) — sada viewport (manje memorije)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -25,20 +25,34 @@ function checkAuth(req, res, next) {
   next();
 }
 
+// ---------- LAUNCH (stability args) ----------
 async function launchBrowser() {
   return await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    defaultViewport: { width: 1366, height: 900 },
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",       // dev/shm crash fix
+      "--disable-gpu",
+      "--no-zygote",
+      "--window-size=1280,1000",
+      "--renderer-process-limit=1",
+      "--js-flags=--max-old-space-size=256",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,site-per-process,IsolateOrigins"
+    ],
+    defaultViewport: { width: 1280, height: 1000 },
   });
 }
 
 function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19); }
 
-async function snap(page, label, shots){
+// viewport screenshot po defaultu (fullPage po potrebi)
+async function snap(page, label, shots, full=false){
   if(!DEBUG) return;
   const name = `${ts()}_${label}.png`;
-  try{ await page.screenshot({ path:name, fullPage:true }); shots.push(name); }catch{}
+  try{ await page.screenshot({ path:name, fullPage:!!full }); shots.push(name); }catch{}
 }
 
 async function clickJS(page, selector){
@@ -131,7 +145,6 @@ async function pickCountry(page, countryName){
 }
 
 // ==== telefon helpers ====
-
 function normalizePhone(raw, defaultCc="+381"){
   if(!raw) return null;
   let s = String(raw).trim().replace(/[^\d+]/g,"");
@@ -140,21 +153,17 @@ function normalizePhone(raw, defaultCc="+381"){
   if(s.startsWith("0"))  return defaultCc + s.slice(1);
   return "+"+s;
 }
-
 function splitIntl(phone){
   const m = String(phone).match(/^\+(\d{1,4})(.*)$/);
   if(!m) return { cc:null, rest: phone.replace(/^\+/, "") };
   return { cc: `+${m[1]}`, rest: m[2].trim().replace(/\s+/g,"") };
 }
-
-// Podesi *phone* dropdown na zemlju (razni tel-pluginovi)
+// phone dropdown → zemlja
 async function setPhoneDialCountry(page, countryName){
-  // česta struktura: .iti__flag-container (intl-tel-input) ili .vti__dropdown (vue-tel-input)
   const openTries = [".iti__flag-container", ".vti__dropdown", ".vti__selection", ".phone-wrapper .dropdown", ".phone-wrapper"];
   for(const sel of openTries){
     if(await page.$(sel)){ await clickJS(page, sel); await sleep(300); break; }
   }
-  // lista zemalja
   const picked = await page.evaluate((name)=>{
     const lists = [
       document.querySelector(".iti__country-list"),
@@ -172,22 +181,19 @@ async function setPhoneDialCountry(page, countryName){
   }, countryName || "Serbia");
   return picked;
 }
-
-// U input telefona *kucamo tastaturom* lokalne cifre (bez +381)
+// kucamo lokalne cifre (bez +381)
 async function typePhoneWithKeyboard(page, localDigits){
   const sels = ["input[type='tel']","input[placeholder*='phone' i]","input[name*='phone' i]","#input-phone"];
   for(const sel of sels){
     if(await page.$(sel)){
-      await page.click(sel, { clickCount: 3 }); // select all
-      // Ctrl/Meta + A → Backspace
+      await page.click(sel, { clickCount: 3 });
       const isMac = await page.evaluate(()=>navigator.platform.includes("Mac"));
       if(isMac){ await page.keyboard.down("Meta"); } else { await page.keyboard.down("Control"); }
       await page.keyboard.press("KeyA");
       if(isMac){ await page.keyboard.up("Meta"); } else { await page.keyboard.up("Control"); }
       await page.keyboard.press("Backspace");
       await page.type(sel, localDigits, { delay: 30 });
-      // blur da validira
-      await page.keyboard.press("Tab");
+      await page.keyboard.press("Tab");   // blur → validacija
       return true;
     }
   }
@@ -242,12 +248,31 @@ app.post("/create-demo", async (req, res) => {
   try{
     browser = await launchBrowser();
     const page = await browser.newPage();
+
+    // --- smanji footprint ---
+    await page.setCacheEnabled(false);
+    await page.setRequestInterception(true);
+    page.on("request", req => {
+      const u = req.url();
+      const t = req.resourceType();
+      if (
+        t === "media" || t === "font" || t === "manifest" ||
+        /googletagmanager|google-analytics|doubleclick|facebook|hotjar|segment|optimizely/i.test(u)
+      ) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+    page.on("error", e => console.log("PAGE ERROR:", e));
+    page.on("pageerror", e => console.log("PAGE JS ERROR:", e));
+
     await page.setDefaultTimeout(45000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
     phase="goto"; log("PHASE:", phase);
-    await page.goto("https://www.avatrade.com/demo-account", { waitUntil:"networkidle2", timeout:60000 });
-    await snap(page,"01_goto",shots);
+    await page.goto("https://www.avatrade.com/demo-account", { waitUntil:"domcontentloaded", timeout:60000 });
+    await snap(page,"01_goto",shots,true); // jedan full rano je OK
     await dismissBanners(page);
     await sleep(500);
 
@@ -282,7 +307,7 @@ app.post("/create-demo", async (req, res) => {
     await page.evaluate(()=>{ const b=document.querySelector("button[type='submit']"); if(b) b.removeAttribute("disabled"); });
     await clickJS(page, "button[type='submit']");
     await Promise.race([
-      page.waitForNavigation({ waitUntil:"networkidle2", timeout:15000 }).catch(()=>{}),
+      page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:15000 }).catch(()=>{}),
       sleep(8000)
     ]);
     await snap(page,"04_after_submit",shots);
