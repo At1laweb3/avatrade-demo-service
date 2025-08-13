@@ -1,7 +1,4 @@
-// index.js — AvaTrade DEMO + MT4 (stabilnije + myvip login + screenshots)
-// DEBUG_SCREENSHOTS=1  -> čuva PNG-ove i loguje "SNAP: <ime>"
-// Rute:  POST /create-demo, POST /create-mt4,  GET /shots/<ime>.png
-
+// index.js — AvaTrade DEMO + MT4 (CF wall bypass + myvip login + screenshots)
 import express from "express";
 import puppeteer from "puppeteer";
 import path from "path";
@@ -69,36 +66,69 @@ async function typeJS(ctx, selector, value){
 }
 
 async function dismissBanners(page){
-  // global (MyVIP i WebTrader)
   await page.evaluate(()=>{
-    // generična dugmad
     const btns = Array.from(document.querySelectorAll("button,a,div[role='button']"));
     const el = btns.find(b=>/accept|got it|agree|allow|close|not now|ok/i.test((b.textContent||"")));
     if(el) el.click();
 
-    // Solitics modal
     const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
     if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
     const pop = document.getElementById("solitics-popup-maker");
     if(pop) pop.style.display="none";
 
-    // “Welcome to Demo Trading!” ili reklame (X dugme)
     const closeEls = [
-      "[aria-label='Close']",
-      ".modal .close", ".modal-close", ".dy-lb-close",
+      "[aria-label='Close']",".modal .close",".modal-close",".dy-lb-close",
       "button[title='Close']", "button:has(svg[aria-label='Close'])"
     ];
     for(const sel of closeEls){
       const e = document.querySelector(sel);
       if(e){ e.dispatchEvent(new MouseEvent("click",{bubbles:true})); }
     }
-    // fallback – klik na krstić
     const xBtns = Array.from(document.querySelectorAll("button, a, span")).filter(n=>/^\s*×\s*$/.test(n.textContent||""));
     if(xBtns[0]) xBtns[0].dispatchEvent(new MouseEvent("click",{bubbles:true}));
   });
 }
 
-// helper: čekaj prvi vidljivi selektor
+// ---------- Cloudflare helpers ----------
+async function isCloudflareWall(page){
+  const url = page.url();
+  const text = await page.evaluate(()=>document.body?document.body.innerText:"");
+  return /cdn-cgi|cloudflare/i.test(url) ||
+         /Verifying you are human/i.test(text) ||
+         /Performance & security by Cloudflare/i.test(text);
+}
+
+// go to url; ako se pojavi CF “verifying…”, napravi backoff + refresh + retry
+async function navigateWithCFBypass(page, url, shots, tag, tries=4){
+  let lastErr = null;
+  for(let i=1;i<=tries;i++){
+    try{
+      await page.setExtraHTTPHeaders({
+        "Accept-Language":"en-US,en;q=0.9,sr-RS;q=0.8",
+        "Upgrade-Insecure-Requests":"1",
+      });
+      await page.goto(url, { waitUntil:"domcontentloaded", timeout:90000 });
+      await dismissBanners(page);
+      await snap(page, `${tag}_nav_${i}`, shots, true);
+
+      if(await isCloudflareWall(page)){
+        await snap(page, `${tag}_cf_${i}`, shots, true);
+        // izađi sa strane, sačekaj, pa nazad
+        await page.goto("about:blank");
+        await sleep(1200 + Math.floor(Math.random()*1200));
+        continue; // retry isti url
+      }
+      return; // uspešno
+    }catch(e){
+      lastErr = e;
+      await sleep(1200);
+    }
+  }
+  if(lastErr) throw lastErr;
+  throw new Error("Cloudflare wall loop at: " + url);
+}
+
+// ---------- generic waits ----------
 async function waitForAny(page, selectors, totalMs=60000){
   const start = Date.now();
   while(Date.now()-start < totalMs){
@@ -165,7 +195,7 @@ async function typePhoneWithKeyboard(page, localDigits){
   return false;
 }
 
-// ==== MT extractors ====
+// ==== text extractors ====
 async function extractPageInfo(page){
   const text = await page.evaluate(()=>document.body?document.body.innerText:"");
   const excerpt = (text||"").replace(/\s+/g," ").slice(0,2000);
@@ -180,7 +210,6 @@ async function extractPageInfo(page){
   if(out.login && out.server) out.found = true;
   return out;
 }
-
 async function waitForOutcome(page, maxMs=60000){
   const start=Date.now();
   const SUCCESS=[/congratulations/i,/account application has been approved/i,/webtrader login details/i,/trade on demo/i,/login details and platforms/i,/Your Demo Account is Being Created/i];
@@ -196,7 +225,7 @@ async function waitForOutcome(page, maxMs=60000){
   return {status:"timeout", text:last.slice(0,2000)};
 }
 
-// smartGoto – probaj poznate DEMO URL-ove
+// ---------- DEMO smart goto ----------
 async function smartGotoDemo(page, shots){
   const urls = [
     "https://www.avatrade.com/demo-account",
@@ -204,7 +233,11 @@ async function smartGotoDemo(page, shots){
   ];
   for(const u of urls){
     log("PHASE: goto ->", u);
-    await page.goto(u, { waitUntil:"domcontentloaded", timeout:90000 });
+    try{
+      await navigateWithCFBypass(page, u, shots, "demo");
+    }catch{
+      continue; // probaj sledeći URL
+    }
     await dismissBanners(page);
     await snap(page, "01_goto", shots, true);
 
@@ -260,7 +293,6 @@ app.post("/create-demo", async (req, res) => {
     await snap(page,"02_filled",shots);
 
     phase="submit";
-    // često biranje države ide implicitno; šaljemo eventove i otključavamo dugme
     await page.evaluate((eSel,pSel)=>{
       const e=document.querySelector(eSel);
       const p=document.querySelector(pSel);
@@ -280,6 +312,11 @@ app.post("/create-demo", async (req, res) => {
       page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
       sleep(9000)
     ]);
+    // ako nas odmah prebaci na CF, rerun trenutnu URL
+    if(await isCloudflareWall(page)){
+      await snap(page,"04_cf_after_submit",shots,true);
+      await navigateWithCFBypass(page, page.url(), shots, "demo_after_submit");
+    }
     await snap(page,"04_after_submit",shots,true);
 
     const textNow = await page.evaluate(()=>document.body?.innerText || "");
@@ -354,7 +391,6 @@ async function selectOptionByText(frame, optionText){
   }, optionText);
   if(okSelect) return true;
 
-  // custom dropdownovi
   await frame.evaluate(()=>{
     const toggles = Array.from(document.querySelectorAll("[role='combobox'], .Select-control, .dropdown, .select, .v-select, .css-1hwfws3, .css-1wa3eu0-placeholder"));
     const t = toggles.find(x=>!!(x.offsetParent || (x.getClientRects && x.getClientRects().length)));
@@ -389,9 +425,9 @@ app.post("/create-mt4", async (req, res)=>{
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    // 1) obavezno prvo MyVIP login (SSO)
+    // 1) MyVIP login (CF bypass)
     phase="myvip-login"; log("PHASE:", phase);
-    await page.goto("https://myvip.avatrade.com/my_account", { waitUntil:"domcontentloaded", timeout:90000 });
+    await navigateWithCFBypass(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip");
     await dismissBanners(page);
     await snap(page,"mt4_00_myvip", shots, true);
 
@@ -406,19 +442,29 @@ app.post("/create-mt4", async (req, res)=>{
         page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{}),
         sleep(8000),
       ]);
+      if(await isCloudflareWall(page)){
+        await snap(page,"mt4_00c_cf_after_login", shots, true);
+        await navigateWithCFBypass(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_retry");
+        // ponovo popuni
+        const emSel = await waitForAny(page, ["input[type='email']","#email","input[name='email']"], 30000);
+        const pwSel = await waitForAny(page, ["input[type='password']","#password","input[name='password']"], 30000);
+        await typeJS(page, emSel, email);
+        await typeJS(page, pwSel, password);
+        await clickJS(page, "button[type='submit'], .btn-primary, button");
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{}),
+          sleep(8000),
+        ]);
+      }
       await dismissBanners(page);
-      await snap(page,"mt4_00c_myvip_after_login", shots, true);
+      await snap(page,"mt4_00d_myvip_after_login", shots, true);
     }
 
-    // 2) CRM accounts
+    // 2) CRM accounts (CF bypass)
     phase="goto-accounts"; log("PHASE:", phase);
-    await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
+    await navigateWithCFBypass(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts");
     await dismissBanners(page);
     await snap(page,"mt4_01_accounts", shots, true);
-
-    // dobrodošlica / reklame (X)
-    await dismissBanners(page);
-    await sleep(600);
 
     // 3) iframe
     phase="iframe"; log("PHASE:", phase);
@@ -446,7 +492,7 @@ app.post("/create-mt4", async (req, res)=>{
     await sleep(2500);
     await snap(page,"mt4_05_after_submit", shots, true);
 
-    // 7) Extract login iz rezultata (iframe ili parent)
+    // 7) Extract login
     phase="extract"; log("PHASE:", phase);
     const credText = await frame.evaluate(()=>document.body?.innerText || "");
     let login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
@@ -471,8 +517,6 @@ app.post("/create-mt4", async (req, res)=>{
 
 /* --------------------- basic routes --------------------- */
 app.get("/", (_req,res)=>res.send("AvaTrade Demo Service live"));
-
-// GET /shots/<filename.png>
 app.use("/shots", (req,res)=>{
   const filename = req.path.replace(/^\/+/, "");
   if(!/\.png$/i.test(filename)) return res.status(400).send("bad file");
