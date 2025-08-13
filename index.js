@@ -1,7 +1,7 @@
-// index.js — AvaTrade demo signup (sa telefonom, auto-detekcija prefiksa)
-// - popunjava: email, password, country, phone (po potrebi samo lokalni deo)
-// - čeka ishod (success/error/timeout)
-// - pravi screenshotove (DEBUG_SCREENSHOTS=1) i vraća javne URL-ove
+// index.js — AvaTrade demo signup (telefon: dropdown + tastatura)
+// - email, password, country, phone
+// - tastaturom trigeruje validaciju telefona
+// - screenshotovi (DEBUG_SCREENSHOTS=1)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -130,13 +130,14 @@ async function pickCountry(page, countryName){
   return !!ok;
 }
 
+// ==== telefon helpers ====
+
 function normalizePhone(raw, defaultCc="+381"){
   if(!raw) return null;
   let s = String(raw).trim().replace(/[^\d+]/g,"");
   if(s.startsWith("+")) return s;
   if(s.startsWith("00")) return "+"+s.slice(2);
-  if(s.startswith?.("0")) return defaultCc + s.slice(1);
-  if(s.startsWith("0")) return defaultCc + s.slice(1);
+  if(s.startsWith("0"))  return defaultCc + s.slice(1);
   return "+"+s;
 }
 
@@ -144,6 +145,53 @@ function splitIntl(phone){
   const m = String(phone).match(/^\+(\d{1,4})(.*)$/);
   if(!m) return { cc:null, rest: phone.replace(/^\+/, "") };
   return { cc: `+${m[1]}`, rest: m[2].trim().replace(/\s+/g,"") };
+}
+
+// Podesi *phone* dropdown na zemlju (razni tel-pluginovi)
+async function setPhoneDialCountry(page, countryName){
+  // česta struktura: .iti__flag-container (intl-tel-input) ili .vti__dropdown (vue-tel-input)
+  const openTries = [".iti__flag-container", ".vti__dropdown", ".vti__selection", ".phone-wrapper .dropdown", ".phone-wrapper"];
+  for(const sel of openTries){
+    if(await page.$(sel)){ await clickJS(page, sel); await sleep(300); break; }
+  }
+  // lista zemalja
+  const picked = await page.evaluate((name)=>{
+    const lists = [
+      document.querySelector(".iti__country-list"),
+      document.querySelector(".vti__dropdown-list"),
+      document.querySelector(".dropdown-menu"),
+      document.querySelector(".dropdown-list")
+    ].filter(Boolean);
+    for(const list of lists){
+      const items = Array.from(list.querySelectorAll("li,div")).filter(el=>/serbia|србија/i.test(el.textContent||""));
+      if(items[0]){ items[0].dispatchEvent(new MouseEvent("click",{bubbles:true})); return true; }
+      const byDial = Array.from(list.querySelectorAll("li,div")).find(el=>/\+381/.test(el.textContent||""));
+      if(byDial){ byDial.dispatchEvent(new MouseEvent("click",{bubbles:true})); return true; }
+    }
+    return false;
+  }, countryName || "Serbia");
+  return picked;
+}
+
+// U input telefona *kucamo tastaturom* lokalne cifre (bez +381)
+async function typePhoneWithKeyboard(page, localDigits){
+  const sels = ["input[type='tel']","input[placeholder*='phone' i]","input[name*='phone' i]","#input-phone"];
+  for(const sel of sels){
+    if(await page.$(sel)){
+      await page.click(sel, { clickCount: 3 }); // select all
+      // Ctrl/Meta + A → Backspace
+      const isMac = await page.evaluate(()=>navigator.platform.includes("Mac"));
+      if(isMac){ await page.keyboard.down("Meta"); } else { await page.keyboard.down("Control"); }
+      await page.keyboard.press("KeyA");
+      if(isMac){ await page.keyboard.up("Meta"); } else { await page.keyboard.up("Control"); }
+      await page.keyboard.press("Backspace");
+      await page.type(sel, localDigits, { delay: 30 });
+      // blur da validira
+      await page.keyboard.press("Tab");
+      return true;
+    }
+  }
+  return false;
 }
 
 async function extractPageInfo(page){
@@ -176,54 +224,17 @@ async function waitForOutcome(page, maxMs=60000){
   return {status:"timeout", text:last.slice(0,2000)};
 }
 
-async function fillPhoneSmart(page, normalizedIntl){
-  // 1) pronađi input
-  const phoneSelectors=["input[type='tel']","input[placeholder*='phone' i]","input[name*='phone' i]","#input-phone"];
-  // 2) proveri da li UI prikazuje prefiks (+xxx) odvojeno
-  const hasSeparatePrefix = await page.evaluate(()=>{
-    // tražimo element sa tekstom poput “+123” u istom redu kao input
-    const inp = document.querySelector("input[type='tel'],input[placeholder*='phone' i],input[name*='phone' i],#input-phone");
-    if(!inp) return { found:false, code:null };
-    const root = inp.closest("div") || inp.parentElement;
-    if(!root) return { found:false, code:null };
-    const codeEl = Array.from(root.querySelectorAll("div,span,button")).find(e=>/^\+\d{1,4}$/.test((e.textContent||"").trim()));
-    return { found: !!codeEl, code: codeEl ? codeEl.textContent.trim() : null };
-  });
-
-  const { cc, rest } = splitIntl(normalizedIntl);
-
-  // 3) upiši pravilnu vrednost
-  let targetValue = normalizedIntl;         // default: ceo broj
-  if(hasSeparatePrefix.found && hasSeparatePrefix.code){
-    // ako UI već pokazuje npr. +381, upisujemo SAMO lokalne cifre
-    // ako se razlikuje (npr. +31), i dalje upisujemo samo rest – UI vodi računa o kodu
-    targetValue = rest.replace(/^\+/, "");
-  }
-
-  for(const sel of phoneSelectors){
-    const ok = await typeJS(page, sel, targetValue);
-    if(ok) return true;
-  }
-  // fallback: agresivna metoda – pokušaj na najbližem inputu uz labelu “Phone”
-  await page.evaluate((value)=>{
-    const txts=Array.from(document.querySelectorAll("label,div,span,p")).filter(e=>/phone/i.test(e.textContent||""));
-    const inp = txts.map(t=>t.parentElement).flatMap(pe=>Array.from(pe.querySelectorAll("input")))[0];
-    if(inp){
-      inp.focus(); inp.value=""; inp.dispatchEvent(new Event("input",{bubbles:true}));
-      inp.value=value; inp.dispatchEvent(new Event("input",{bubbles:true})); inp.dispatchEvent(new Event("change",{bubbles:true}));
-    }
-  }, targetValue);
-  return true;
-}
-
 // ===== API =====
-app.post("/create-demo", checkAuth, async (req, res) => {
+app.post("/create-demo", async (req, res) => {
+  if (req.headers["x-auth"] !== SHARED_SECRET) return res.status(401).json({ ok:false, error:"Unauthorized" });
+
   const { name, email, password, phone, country="Serbia" } = req.body || {};
   if(!name || !email || !password || !phone){
     return res.status(400).json({ ok:false, error:"Missing fields (name, email, password, phone required)" });
   }
   const defaultCc = country.toLowerCase().includes("serb")?"+381":"+387";
   const normPhone = normalizePhone(phone, defaultCc);
+  const { cc, rest } = splitIntl(normPhone);            // npr. +381 i "654935136"
 
   let browser, phase="init";
   const shots=[];
@@ -246,8 +257,9 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     await typeJS(page, "#input-email", email);
     await typeJS(page, "#input-password", password);
 
-    // PHONE (smart)
-    await fillPhoneSmart(page, normPhone);
+    // PHONE dropdown → Serbia, pa kucanje lokalnih cifara
+    await setPhoneDialCountry(page, country);
+    await typePhoneWithKeyboard(page, rest);   // tastaturom trigerujemo validaciju
     await snap(page,"02_filled",shots);
 
     phase="country"; log("PHASE:", phase);
