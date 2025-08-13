@@ -1,4 +1,4 @@
-// index.js — AvaTrade demo signup (debug phases + JS-only clicks)
+// index.js — AvaTrade demo signup (debug phases + JS-only clicks + signup sniff + portal login probe)
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -55,7 +55,6 @@ async function typeJS(page, selector, value) {
 }
 
 async function openCountryDropdown(page) {
-  // više pokušaja
   const tries = [
     ".country-wrapper .vue-country-select .dropdown",
     ".country-wrapper .vue-country-select",
@@ -66,11 +65,9 @@ async function openCountryDropdown(page) {
   for (const sel of tries) {
     if (await clickJS(page, sel)) {
       await sleep(400);
-      const opened = await page.$(".dropdown-list");
-      if (opened) return true;
+      if (await page.$(".dropdown-list")) return true;
     }
   }
-  // probaj preko teksta
   await page.evaluate(() => {
     const textHits = ["choose a country","country","select country"];
     const els = Array.from(document.querySelectorAll("button,div,span,input"));
@@ -86,20 +83,16 @@ async function openCountryDropdown(page) {
 }
 
 async function pickCountry(page, countryName) {
-  // 1) search u listi
   const searchSel = ".dropdown-list input[type='search'], .dropdown-list input[role='combobox'], .dropdown-list input[aria-autocomplete='list']";
-  const hasSearch = await page.$(searchSel);
-  if (hasSearch) {
+  if (await page.$(searchSel)) {
     await typeJS(page, searchSel, countryName);
     await page.keyboard.press("Enter");
     return true;
   }
-  // 2) flag za Srbiju
   if (await page.$(".dropdown-list li.dropdown-item .vti__flag.rs")) {
     await clickJS(page, ".dropdown-list li.dropdown-item .vti__flag.rs");
     return true;
   }
-  // 3) skrol + klik po tekstu
   const names = [countryName, "Serbia (Србија)"];
   const ok = await page.evaluate((names) => {
     const list = document.querySelector(".dropdown-list") || document.body;
@@ -135,25 +128,89 @@ async function extractPageInfo(page) {
   return out;
 }
 
+// Pokušaj portala: klikni "Login" tab pored "Sign Up", popuni i probaj, vrati poruku
+async function tryPortalLogin(page, email, password) {
+  try {
+    // Ako je na istoj komponenti: klik na "Login" tab
+    await page.evaluate(() => {
+      const tabs = Array.from(document.querySelectorAll("a,button,div"));
+      const loginTab = tabs.find(el => /login/i.test((el.textContent || "").trim()));
+      if (loginTab) loginTab.click();
+    });
+    await sleep(600);
+
+    // Polja u login tabu (često ista ID/placeholder imena)
+    const emailOk = await typeJS(page, "input[type='email'], #input-email, input[placeholder*='mail' i]", email);
+    const passOk  = await typeJS(page, "input[type='password'], #input-password, input[placeholder*='password' i]", password);
+
+    if (!emailOk || !passOk) {
+      // probaj da odeš na /login stranu, ako postoji
+      await page.goto("https://www.avatrade.com/login", { waitUntil: "networkidle2", timeout: 20000 }).catch(() => {});
+      await typeJS(page, "input[type='email'], #input-email, input[placeholder*='mail' i]", email);
+      await typeJS(page, "input[type='password'], #input-password, input[placeholder*='password' i]", password);
+    }
+
+    await clickJS(page, "button[type='submit'], button:has(>span:contains('Login'))");
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 }).catch(() => {}),
+      sleep(4000)
+    ]);
+
+    // Ako je ostao na formi, pokušaj da pročitaš grešku
+    const err = await page.evaluate(() => {
+      const cands = Array.from(document.querySelectorAll(".error, .form-error, .alert, .validation, [role='alert'], .ng-invalid, .text-danger"));
+      for (const el of cands) {
+        const t = (el.textContent || "").trim();
+        if (t && t.length > 3) return t.slice(0, 300);
+      }
+      // fallback: traži ključne reči u telu
+      const body = (document.body.innerText || "").toLowerCase();
+      if (body.includes("incorrect") || body.includes("invalid") || body.includes("activate")) {
+        return (document.body.innerText || "").slice(0, 300);
+      }
+      return null;
+    });
+
+    return { success: !err, error_text: err || null, url: page.url() };
+  } catch (e) {
+    return { success: false, error_text: String(e), url: page.url() };
+  }
+}
+
 // ---------- route ----------
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, country = "Serbia" } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ ok:false, error:"Missing fields" });
 
   let browser, phase = "init";
+  // signup sniff
+  let signupStatus = null, signupMsg = null;
+
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
     await page.setDefaultTimeout(45000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    phase = "goto";
-    log("PHASE:", phase);
+    // prisluškuj XHR/Fetch – uhvati odgovor signup-a
+    page.on("response", async (resp) => {
+      try {
+        const url = resp.url();
+        if (/signup|register|submit|lead/i.test(url)) {
+          const status = resp.status();
+          let body = "";
+          try { body = await resp.text(); } catch {}
+          signupStatus = status;
+          signupMsg = (body || "").slice(0, 400);
+        }
+      } catch {}
+    });
+
+    phase = "goto"; log("PHASE:", phase);
     await page.goto("https://www.avatrade.com/demo-account", { waitUntil: "networkidle2", timeout: 60000 });
     await sleep(800);
 
-    phase = "cookies";
-    log("PHASE:", phase);
+    phase = "cookies"; log("PHASE:", phase);
     await page.evaluate(() => {
       const texts = ["accept","accept all","i agree","got it","not now","close"];
       const els = Array.from(document.querySelectorAll("button,a"));
@@ -164,26 +221,23 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       if (el) el.click();
     });
 
-    phase = "fill";
-    log("PHASE:", phase);
+    phase = "fill"; log("PHASE:", phase);
     await page.waitForSelector("#input-email");
     await page.waitForSelector("#input-password");
     await typeJS(page, "#input-email", email);
     await typeJS(page, "#input-password", password);
 
-    phase = "country-open";
-    log("PHASE:", phase);
+    phase = "country-open"; log("PHASE:", phase);
     const opened = await openCountryDropdown(page);
     if (!opened) throw new Error("Country dropdown not opened");
 
-    phase = "country-pick";
-    log("PHASE:", phase);
+    phase = "country-pick"; log("PHASE:", phase);
     const picked = await pickCountry(page, country);
     if (!picked) throw new Error(`Country '${country}' not selected`);
     await sleep(300);
 
-    phase = "submit";
-    log("PHASE:", phase);
+    phase = "submit"; log("PHASE:", phase);
+    // trigger validation
     await page.evaluate(() => {
       const e = document.querySelector("#input-email");
       const p = document.querySelector("#input-password");
@@ -195,7 +249,6 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       }
     });
     await sleep(400);
-    // oslobodi dugme i klikni JS-om
     await page.evaluate(() => { const b = document.querySelector("button[type='submit']"); if (b) b.removeAttribute("disabled"); });
     await clickJS(page, "button[type='submit']");
     await Promise.race([
@@ -203,24 +256,28 @@ app.post("/create-demo", checkAuth, async (req, res) => {
       sleep(8000)
     ]);
 
-    phase = "extract";
-    log("PHASE:", phase);
+    phase = "extract"; log("PHASE:", phase);
     const mt = await extractPageInfo(page);
+    let portalLogin = await tryPortalLogin(page, email, password);
+
     try { await page.screenshot({ path: "after_submit.png", fullPage: true }); } catch {}
 
     return res.json({
       ok: true,
       note: "Submit executed",
       url: page.url(),
+      signup_status: signupStatus,
+      signup_msg: signupMsg,
       mt_login: mt.login,
       mt_server: mt.server,
       mt_password: mt.password || password,
+      portal_login_attempt: portalLogin,
       page_excerpt: mt.excerpt,
     });
 
   } catch (e) {
     console.error("create-demo error:", e?.message || e, "AT PHASE:", phase);
-    return res.status(500).json({ ok:false, error: String(e), phase });
+    return res.status(500).json({ ok:false, error: String(e), phase, signup_status: signupStatus, signup_msg: signupMsg });
   } finally {
     try { if (browser) await browser.close(); } catch {}
   }
