@@ -1,5 +1,5 @@
-// index.js — AvaTrade demo signup (sa telefonom)
-// - popunjava: email, password, country, phone
+// index.js — AvaTrade demo signup (sa telefonom, auto-detekcija prefiksa)
+// - popunjava: email, password, country, phone (po potrebi samo lokalni deo)
 // - čeka ishod (success/error/timeout)
 // - pravi screenshotove (DEBUG_SCREENSHOTS=1) i vraća javne URL-ove
 
@@ -135,8 +135,15 @@ function normalizePhone(raw, defaultCc="+381"){
   let s = String(raw).trim().replace(/[^\d+]/g,"");
   if(s.startsWith("+")) return s;
   if(s.startsWith("00")) return "+"+s.slice(2);
-  if(s.startsWith("0"))  return defaultCc + s.slice(1);
+  if(s.startswith?.("0")) return defaultCc + s.slice(1);
+  if(s.startsWith("0")) return defaultCc + s.slice(1);
   return "+"+s;
+}
+
+function splitIntl(phone){
+  const m = String(phone).match(/^\+(\d{1,4})(.*)$/);
+  if(!m) return { cc:null, rest: phone.replace(/^\+/, "") };
+  return { cc: `+${m[1]}`, rest: m[2].trim().replace(/\s+/g,"") };
 }
 
 async function extractPageInfo(page){
@@ -169,13 +176,54 @@ async function waitForOutcome(page, maxMs=60000){
   return {status:"timeout", text:last.slice(0,2000)};
 }
 
+async function fillPhoneSmart(page, normalizedIntl){
+  // 1) pronađi input
+  const phoneSelectors=["input[type='tel']","input[placeholder*='phone' i]","input[name*='phone' i]","#input-phone"];
+  // 2) proveri da li UI prikazuje prefiks (+xxx) odvojeno
+  const hasSeparatePrefix = await page.evaluate(()=>{
+    // tražimo element sa tekstom poput “+123” u istom redu kao input
+    const inp = document.querySelector("input[type='tel'],input[placeholder*='phone' i],input[name*='phone' i],#input-phone");
+    if(!inp) return { found:false, code:null };
+    const root = inp.closest("div") || inp.parentElement;
+    if(!root) return { found:false, code:null };
+    const codeEl = Array.from(root.querySelectorAll("div,span,button")).find(e=>/^\+\d{1,4}$/.test((e.textContent||"").trim()));
+    return { found: !!codeEl, code: codeEl ? codeEl.textContent.trim() : null };
+  });
+
+  const { cc, rest } = splitIntl(normalizedIntl);
+
+  // 3) upiši pravilnu vrednost
+  let targetValue = normalizedIntl;         // default: ceo broj
+  if(hasSeparatePrefix.found && hasSeparatePrefix.code){
+    // ako UI već pokazuje npr. +381, upisujemo SAMO lokalne cifre
+    // ako se razlikuje (npr. +31), i dalje upisujemo samo rest – UI vodi računa o kodu
+    targetValue = rest.replace(/^\+/, "");
+  }
+
+  for(const sel of phoneSelectors){
+    const ok = await typeJS(page, sel, targetValue);
+    if(ok) return true;
+  }
+  // fallback: agresivna metoda – pokušaj na najbližem inputu uz labelu “Phone”
+  await page.evaluate((value)=>{
+    const txts=Array.from(document.querySelectorAll("label,div,span,p")).filter(e=>/phone/i.test(e.textContent||""));
+    const inp = txts.map(t=>t.parentElement).flatMap(pe=>Array.from(pe.querySelectorAll("input")))[0];
+    if(inp){
+      inp.focus(); inp.value=""; inp.dispatchEvent(new Event("input",{bubbles:true}));
+      inp.value=value; inp.dispatchEvent(new Event("input",{bubbles:true})); inp.dispatchEvent(new Event("change",{bubbles:true}));
+    }
+  }, targetValue);
+  return true;
+}
+
 // ===== API =====
 app.post("/create-demo", checkAuth, async (req, res) => {
   const { name, email, password, phone, country="Serbia" } = req.body || {};
   if(!name || !email || !password || !phone){
     return res.status(400).json({ ok:false, error:"Missing fields (name, email, password, phone required)" });
   }
-  const normPhone = normalizePhone(phone, country.toLowerCase().includes("serb")?"+381":"+387");
+  const defaultCc = country.toLowerCase().includes("serb")?"+381":"+387";
+  const normPhone = normalizePhone(phone, defaultCc);
 
   let browser, phase="init";
   const shots=[];
@@ -198,24 +246,8 @@ app.post("/create-demo", checkAuth, async (req, res) => {
     await typeJS(page, "#input-email", email);
     await typeJS(page, "#input-password", password);
 
-    // PHONE
-    const phoneSelectors=["input[type='tel']","input[placeholder*='phone' i]","input[name*='phone' i]","#input-phone"];
-    let phoneFilled=false;
-    for(const sel of phoneSelectors){
-      const ok = await typeJS(page, sel, normPhone);
-      if(ok){ phoneFilled=true; break; }
-    }
-    if(!phoneFilled){
-      await page.evaluate((value)=>{
-        const txts=Array.from(document.querySelectorAll("label,div,span,p")).filter(e=>/phone/i.test(e.textContent||""));
-        const inp = txts.map(t=>t.parentElement).flatMap(pe=>Array.from(pe.querySelectorAll("input")))[0];
-        if(inp){
-          inp.focus(); inp.value=""; inp.dispatchEvent(new Event("input",{bubbles:true}));
-          inp.value=value; inp.dispatchEvent(new Event("input",{bubbles:true})); inp.dispatchEvent(new Event("change",{bubbles:true}));
-        }
-      }, normPhone);
-    }
-
+    // PHONE (smart)
+    await fillPhoneSmart(page, normPhone);
     await snap(page,"02_filled",shots);
 
     phase="country"; log("PHASE:", phase);
