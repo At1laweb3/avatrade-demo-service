@@ -1,5 +1,6 @@
-// index.js — AvaTrade demo + MT4 (robust) + screenshots served via /shots
-// DEBUG_SCREENSHOTS=1 -> čuva PNG i u logu ispisuje "SNAP: <ime>"
+// index.js — AvaTrade DEMO + MT4 (stabilnije + myvip login + screenshots)
+// DEBUG_SCREENSHOTS=1  -> čuva PNG-ove i loguje "SNAP: <ime>"
+// Rute:  POST /create-demo, POST /create-mt4,  GET /shots/<ime>.png
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -11,12 +12,11 @@ app.use(express.json());
 
 const SHARED_SECRET = process.env.PUPPETEER_SHARED_SECRET || "superSecret123";
 const PORT = process.env.PORT || 3000;
-// podrazumevano UKLJUČENO (možeš da ugasiš sa DEBUG_SCREENSHOTS=0)
-const DEBUG = (process.env.DEBUG_SCREENSHOTS ?? "1") === "1";
+const DEBUG = process.env.DEBUG_SCREENSHOTS === "1";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ts = () => new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 const log = (...a) => console.log(...a);
+function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19); }
 
 // ---------- LAUNCH ----------
 async function launchBrowser() {
@@ -27,123 +27,94 @@ async function launchBrowser() {
       "--disable-gpu","--no-zygote","--window-size=1280,1000",
       "--renderer-process-limit=1","--js-flags=--max-old-space-size=256",
       "--no-first-run","--no-default-browser-check",
-      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,site-per-process,IsolateOrigins"
+      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,site-per-process,IsolateOrigins",
     ],
     defaultViewport: { width: 1280, height: 1000 },
   });
 }
 
-async function snap(page, label, shots, full=false) {
-  if (!DEBUG) return;
+async function snap(page, label, shots, full=false){
+  if(!DEBUG) return;
   const name = `${ts()}_${label}.png`;
-  try { await page.screenshot({ path: name, fullPage: !!full }); shots.push(name); console.log("SNAP:", name); } catch {}
+  try{
+    await page.screenshot({ path:name, fullPage:!!full });
+    shots.push(name);
+    console.log("SNAP:", name);
+  }catch{}
 }
 
-async function clickJS(ctx, selector) {
-  const ok = await ctx.evaluate((sel) => {
+async function clickJS(ctx, selector){
+  const ok = await ctx.evaluate((sel)=>{
     const el = document.querySelector(sel);
-    if (!el) return false;
-    el.scrollIntoView({ block: "center", inline: "center" });
-    for (const t of ["pointerdown","mousedown","click","pointerup","mouseup"])
-      el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    if(!el) return false;
+    el.scrollIntoView({block:"center", inline:"center"});
+    const evts=["pointerdown","mousedown","click","pointerup","mouseup"];
+    for(const t of evts) el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));
     return true;
   }, selector);
   return !!ok;
 }
-async function typeJS(ctx, selector, value) {
-  return await ctx.evaluate((sel, val) => {
+
+async function typeJS(ctx, selector, value){
+  return await ctx.evaluate((sel,val)=>{
     const el = document.querySelector(sel);
-    if (!el) return false;
-    el.focus(); el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.value = val; el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
+    if(!el) return false;
+    el.focus(); el.value="";
+    el.dispatchEvent(new Event("input",{bubbles:true}));
+    el.value = val;
+    el.dispatchEvent(new Event("input",{bubbles:true}));
+    el.dispatchEvent(new Event("change",{bubbles:true}));
     return true;
   }, selector, value);
 }
 
-async function dismissBanners(page) {
-  await page.evaluate(() => {
+async function dismissBanners(page){
+  // global (MyVIP i WebTrader)
+  await page.evaluate(()=>{
+    // generična dugmad
     const btns = Array.from(document.querySelectorAll("button,a,div[role='button']"));
-    const el = btns.find(b => /accept|got it|agree|allow|close|not now|ok/i.test((b.textContent||"")));
-    if (el) el.click();
+    const el = btns.find(b=>/accept|got it|agree|allow|close|not now|ok/i.test((b.textContent||"")));
+    if(el) el.click();
+
+    // Solitics modal
     const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
-    if (x) x.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
     const pop = document.getElementById("solitics-popup-maker");
-    if (pop) pop.style.display = "none";
+    if(pop) pop.style.display="none";
+
+    // “Welcome to Demo Trading!” ili reklame (X dugme)
+    const closeEls = [
+      "[aria-label='Close']",
+      ".modal .close", ".modal-close", ".dy-lb-close",
+      "button[title='Close']", "button:has(svg[aria-label='Close'])"
+    ];
+    for(const sel of closeEls){
+      const e = document.querySelector(sel);
+      if(e){ e.dispatchEvent(new MouseEvent("click",{bubbles:true})); }
+    }
+    // fallback – klik na krstić
+    const xBtns = Array.from(document.querySelectorAll("button, a, span")).filter(n=>/^\s*×\s*$/.test(n.textContent||""));
+    if(xBtns[0]) xBtns[0].dispatchEvent(new MouseEvent("click",{bubbles:true}));
   });
 }
 
-async function waitForAny(page, selectors, totalMs=60000) {
+// helper: čekaj prvi vidljivi selektor
+async function waitForAny(page, selectors, totalMs=60000){
   const start = Date.now();
-  while (Date.now() - start < totalMs) {
-    for (const sel of selectors) {
+  while(Date.now()-start < totalMs){
+    for(const sel of selectors){
       const el = await page.$(sel);
-      if (el) {
+      if(el){
         const vis = await page.evaluate(e => !!(e.offsetParent || (e.getClientRects && e.getClientRects().length)), el);
-        if (vis) return sel;
+        if(vis) return sel;
       }
     }
-    await sleep(400);
+    await sleep(350);
   }
   throw new Error("none of selectors appeared: " + selectors.join(" | "));
 }
 
-// ===== helpers (country/phone)
-async function openCountryDropdown(page){
-  const tries = [
-    ".country-wrapper .vue-country-select .dropdown",
-    ".country-wrapper .vue-country-select",
-    "input[placeholder='Choose a country']",
-    ".country-wrapper .selected-flag",
-    ".country-wrapper"
-  ];
-  for (const sel of tries) {
-    if (await clickJS(page, sel)) {
-      await sleep(400);
-      if (await page.$(".dropdown-list")) return true;
-    }
-  }
-  await page.evaluate(()=>{
-    const hits = ["choose a country","country","select country"];
-    const els = Array.from(document.querySelectorAll("button,div,span,input"));
-    const el = els.find(e=>{
-      const t=((e.textContent||e.placeholder||"")+"").toLowerCase();
-      const vis=!!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
-      return vis && hits.some(h=>t.includes(h));
-    });
-    if(el) el.click();
-  });
-  await sleep(400);
-  return !!(await page.$(".dropdown-list"));
-}
-async function pickCountry(page, countryName){
-  const searchSel = ".dropdown-list input[type='search'], .dropdown-list input[role='combobox'], .dropdown-list input[aria-autocomplete='list']";
-  if (await page.$(searchSel)) {
-    await typeJS(page, searchSel, countryName);
-    await page.keyboard.press("Enter");
-    return true;
-  }
-  if (await page.$(".dropdown-list li.dropdown-item .vti__flag.rs")) {
-    await clickJS(page, ".dropdown-list li.dropdown-item .vti__flag.rs");
-    return true;
-  }
-  const names=[countryName,"Serbia (Србија)"];
-  const ok = await page.evaluate((names)=>{
-    const list = document.querySelector(".dropdown-list") || document.body;
-    function vis(el){ return !!(el.offsetParent || (el.getClientRects && el.getClientRects().length)); }
-    for(let p=0;p<80;p++){
-      const items = Array.from(list.querySelectorAll("li.dropdown-item, li, div.dropdown-item")).filter(vis);
-      const target = items.find(it=>{
-        const txt=(it.textContent||"").trim().toLowerCase();
-        return names.some(n=>txt.includes(n.toLowerCase()));
-      });
-      if(target){ target.click(); return true; }
-      list.scrollBy(0,260);
-    }
-    return false;
-  }, names);
-  return !!ok;
-}
+// ==== phone helpers (create-demo) ====
 function normalizePhone(raw, defaultCc="+381"){
   if(!raw) return null;
   let s = String(raw).trim().replace(/[^\d+]/g,"");
@@ -194,7 +165,7 @@ async function typePhoneWithKeyboard(page, localDigits){
   return false;
 }
 
-// ==== extract/outcome ====
+// ==== MT extractors ====
 async function extractPageInfo(page){
   const text = await page.evaluate(()=>document.body?document.body.innerText:"");
   const excerpt = (text||"").replace(/\s+/g," ").slice(0,2000);
@@ -210,10 +181,10 @@ async function extractPageInfo(page){
   return out;
 }
 
-async function waitForOutcome(page, maxMs=70000){
+async function waitForOutcome(page, maxMs=60000){
   const start=Date.now();
-  const SUCCESS=[/congratulations/i,/account application has been approved/i,/webtrader login details/i,/trade on demo/i,/login details and platforms/i,/Your Demo Account is Being Created/i,/You will be transferred/i,/Thank you for your registration/i];
-  const ERROR=[/error/i,/incorrect/i,/already used/i,/already exists/i,/try again/i,/protection/i,/blocked/i,/robot/i,/captcha/i,/not valid/i,/invalid/i,/failed/i,/sorry/i, /☹/];
+  const SUCCESS=[/congratulations/i,/account application has been approved/i,/webtrader login details/i,/trade on demo/i,/login details and platforms/i,/Your Demo Account is Being Created/i];
+  const ERROR=[/error/i,/incorrect/i,/already used/i,/already exists/i,/try again/i,/protection/i,/blocked/i,/robot/i,/captcha/i,/not valid/i,/invalid/i];
   let last="";
   while(Date.now()-start<maxMs){
     const t = await page.evaluate(()=>document.body?document.body.innerText:"");
@@ -225,7 +196,7 @@ async function waitForOutcome(page, maxMs=70000){
   return {status:"timeout", text:last.slice(0,2000)};
 }
 
-// smartGoto demo
+// smartGoto – probaj poznate DEMO URL-ove
 async function smartGotoDemo(page, shots){
   const urls = [
     "https://www.avatrade.com/demo-account",
@@ -236,18 +207,20 @@ async function smartGotoDemo(page, shots){
     await page.goto(u, { waitUntil:"domcontentloaded", timeout:90000 });
     await dismissBanners(page);
     await snap(page, "01_goto", shots, true);
-    const emailCandidates=["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"];
-    const passCandidates =["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"];
+
+    const emailCandidates = ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"];
+    const passCandidates  = ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"];
+
     try{
       const emailSel = await waitForAny(page, emailCandidates, 8000);
       const passSel  = await waitForAny(page, passCandidates, 8000);
       return { emailSel, passSel };
-    }catch{ /* try next */ }
+    }catch{}
   }
   throw new Error("Demo form not found on known URLs");
 }
 
-// ===== /create-demo =====
+/* =====================  /create-demo  ===================== */
 app.post("/create-demo", async (req, res) => {
   if (req.headers["x-auth"] !== SHARED_SECRET) return res.status(401).json({ ok:false, error:"Unauthorized" });
 
@@ -255,17 +228,16 @@ app.post("/create-demo", async (req, res) => {
   if(!name || !email || !password || !phone){
     return res.status(400).json({ ok:false, error:"Missing fields (name, email, password, phone required)" });
   }
-
   const defaultCc = country.toLowerCase().includes("serb")?"+381":"+387";
   const normPhone = normalizePhone(phone, defaultCc);
   const { rest } = splitIntl(normPhone);
 
-  let browser, phase="init"; const shots=[];
+  let browser, phase="init";
+  const shots=[];
+
   try{
     browser = await launchBrowser();
     const page = await browser.newPage();
-    await page.setDefaultTimeout(90000);
-    await page.setDefaultNavigationTimeout(90000);
 
     await page.setRequestInterception(true);
     page.on("request", req => {
@@ -273,6 +245,7 @@ app.post("/create-demo", async (req, res) => {
       if (t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
       else req.continue();
     });
+    await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
     phase="goto";
@@ -281,15 +254,13 @@ app.post("/create-demo", async (req, res) => {
     phase="fill";
     await typeJS(page, emailSel, email);
     await typeJS(page, passSel, password);
+
     await setPhoneDialCountry(page, country);
     await typePhoneWithKeyboard(page, rest);
     await snap(page,"02_filled",shots);
 
-    phase="country";
-    if(await openCountryDropdown(page)) await pickCountry(page, country);
-    await snap(page,"03_country",shots);
-
     phase="submit";
+    // često biranje države ide implicitno; šaljemo eventove i otključavamo dugme
     await page.evaluate((eSel,pSel)=>{
       const e=document.querySelector(eSel);
       const p=document.querySelector(pSel);
@@ -299,45 +270,35 @@ app.post("/create-demo", async (req, res) => {
         el.dispatchEvent(new Event("change",{bubbles:true}));
         el.blur();
       }
-      const b=document.querySelector("button[type='submit']") ||
-        Array.from(document.querySelectorAll("button")).find(b=>/submit|sign up|start/i.test(b.textContent||""));
+      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(b=>/submit|sign up|start/i.test(b.textContent||""));
       if(b) b.removeAttribute("disabled");
     }, emailSel, passSel);
 
     await dismissBanners(page);
-    await sleep(400);
-
     await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
     await Promise.race([
       page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
-      sleep(8000)
+      sleep(9000)
     ]);
     await snap(page,"04_after_submit",shots,true);
 
-    const nowText = await page.evaluate(()=>document.body?.innerText || "");
-    const looksLikeCreating = /Your Demo Account is Being Created|You will be transferred/i.test(nowText);
-    if (looksLikeCreating) await snap(page,"04b_being_created",shots,true);
+    const textNow = await page.evaluate(()=>document.body?.innerText || "");
+    if (/Your Demo Account is Being Created/i.test(textNow)) await snap(page, "04b_being_created", shots, true);
 
     phase="outcome";
-    const outcome = await waitForOutcome(page, 65000);
+    const outcome = await waitForOutcome(page, 60000);
     await snap(page, `05_outcome_${outcome.status}`, shots);
 
     phase="extract";
     const mt = await extractPageInfo(page);
-
-    // heuristika "likely_created" – ako je "Being Created" ili smo na /crm/accounts
-    const urlNow = page.url();
-    const likely_created = looksLikeCreating || /\/crm\/accounts/.test(urlNow) ||
-      /Thank you for your registration/i.test(outcome.text||"");
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
     const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
 
     return res.json({
       ok: outcome.status === "success",
-      likely_created,
-      note: `Outcome: ${outcome.status}${likely_created ? " (likely_created)" : ""}`,
-      url: urlNow,
+      note: `Outcome: ${outcome.status}`,
+      url: page.url(),
       outcome_excerpt: outcome.text?.slice(0,500) || "",
       mt_login: mt.login,
       mt_server: mt.server,
@@ -354,7 +315,7 @@ app.post("/create-demo", async (req, res) => {
   }
 });
 
-// ===== helpers za MT4 (iframe)
+/* ----------------------- helpers za MT4 ----------------------- */
 async function getMyAccountFrame(page){
   const handle = await page.waitForSelector('#my_account, iframe[src*="avacrm"]', { timeout: 90000 });
   const frame = await handle.contentFrame();
@@ -393,6 +354,7 @@ async function selectOptionByText(frame, optionText){
   }, optionText);
   if(okSelect) return true;
 
+  // custom dropdownovi
   await frame.evaluate(()=>{
     const toggles = Array.from(document.querySelectorAll("[role='combobox'], .Select-control, .dropdown, .select, .v-select, .css-1hwfws3, .css-1wa3eu0-placeholder"));
     const t = toggles.find(x=>!!(x.offsetParent || (x.getClientRects && x.getClientRects().length)));
@@ -406,147 +368,93 @@ async function selectOptionByText(frame, optionText){
   return !!picked;
 }
 
-// page-level click by text (za SSO)
-async function pageClickByText(page, tags, rx) {
-  return await page.evaluate((tags, pattern) => {
-    const re = new RegExp(pattern, "i");
-    const els = Array.from(document.querySelectorAll(tags.join(",")));
-    const el = els.find(e => {
-      const t = (e.textContent || "").trim();
-      const vis = !!(e.offsetParent || (e.getClientRects && e.getClientRects().length));
-      return vis && re.test(t);
-    });
-    if (!el) return false;
-    el.scrollIntoView({ block: "center" });
-    ["pointerdown","mousedown","click","pointerup","mouseup"].forEach(t =>
-      el.dispatchEvent(new MouseEvent(t, { bubbles: true }))
-    );
-    return true;
-  }, tags, rx.source);
-}
-
-// robust SSO login
-async function ensureLoggedIn(page, email, password, shots){
-  const ifr = await page.$('#my_account, iframe[src*="avacrm"]');
-  if (ifr) return true;
-
-  const emailSels = [
-    "input[type='email']","input[name='email']","#email","input#formBasicEmail",
-    "input[name='Email']","input[placeholder*='email' i]","input[name='username']"
-  ];
-  const passSels  = [
-    "input[type='password']","input[name='password']","#password",
-    "input#formBasicPassword","input[placeholder*='password' i]"
-  ];
-
-  async function tryFillHere() {
-    try{
-      const eSel = await waitForAny(page, emailSels, 7000);
-      const pSel = await waitForAny(page, passSels, 7000);
-      await typeJS(page, eSel, email);
-      await typeJS(page, pSel, password);
-      await snap(page, "mt4_login_filled_here", shots);
-      await pageClickByText(page, ["button","a","div","span","input[type='submit']"], /(log ?in|sign ?in|continue|submit)/i);
-      await Promise.race([
-        page.waitForNavigation({ waitUntil:"domcontentloaded", timeout:20000 }).catch(()=>{}),
-        sleep(8000),
-      ]);
-      return true;
-    }catch{ return false; }
-  }
-
-  await pageClickByText(page, ["button","a","div","span"], /(continue.*email|sign in.*email|use email)/i);
-  await sleep(500);
-  if (await tryFillHere()) return true;
-
-  const loginUrls = [
-    "https://accounts.avatrade.com/login",
-    "https://webtrader7.avatrade.com/login",
-    "https://www.avatrade.com/login",
-    "https://my.avatrade.com/login"
-  ];
-  for(const u of loginUrls){
-    try{
-      log("LOGIN: goto", u);
-      await page.goto(u, { waitUntil:"domcontentloaded", timeout:60000 });
-      await dismissBanners(page);
-      await snap(page, "mt4_login_page", shots, true);
-      await pageClickByText(page, ["button","a","div","span"], /(continue.*email|sign in|log in)/i);
-      await sleep(500);
-      if (await tryFillHere()) break;
-    }catch{}
-  }
-
-  await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
-  await dismissBanners(page);
-  await snap(page, "mt4_accounts_after_login", shots, true);
-  return !!(await page.$('#my_account, iframe[src*="avacrm"]'));
-}
-
-// ===== /create-mt4 =====
-app.post("/create-mt4", async (req, res) => {
+/* =====================  /create-mt4  ===================== */
+app.post("/create-mt4", async (req, res)=>{
   if (req.headers["x-auth"] !== SHARED_SECRET) return res.status(401).json({ ok:false, error:"Unauthorized" });
 
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ ok:false, error:"Missing email/password" });
+  if(!email || !password) return res.status(400).json({ ok:false, error:"Missing email/password" });
 
   let browser; const shots=[]; let phase="init";
   try{
     browser = await launchBrowser();
     const page = await browser.newPage();
 
-    await page.setDefaultTimeout(90000);
-    await page.setDefaultNavigationTimeout(90000);
-
     await page.setRequestInterception(true);
     page.on("request", req => {
-      const u = req.url(); const t = req.resourceType();
+      const u = req.url(); const t=req.resourceType();
       if (t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
       else req.continue();
     });
+    await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
-    phase="goto-accounts";
-    await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
+    // 1) obavezno prvo MyVIP login (SSO)
+    phase="myvip-login"; log("PHASE:", phase);
+    await page.goto("https://myvip.avatrade.com/my_account", { waitUntil:"domcontentloaded", timeout:90000 });
     await dismissBanners(page);
-    await snap(page,"mt4_01_accounts",shots,true);
+    await snap(page,"mt4_00_myvip", shots, true);
 
-    phase="maybe-login";
-    if (!(await page.$('#my_account, iframe[src*="avacrm"]'))) {
-      const okLogin = await ensureLoggedIn(page, email, password, shots);
-      if (!okLogin) throw new Error("login flow failed (no iframe after attempts)");
+    const loginEmailSel = await waitForAny(page, ["input[type='email']","#email","input[name='email']"], 30000).catch(()=>null);
+    const loginPassSel  = await waitForAny(page, ["input[type='password']","#password","input[name='password']"], 30000).catch(()=>null);
+    if (loginEmailSel && loginPassSel) {
+      await typeJS(page, loginEmailSel, email);
+      await typeJS(page, loginPassSel, password);
+      await snap(page,"mt4_00b_myvip_filled", shots);
+      await clickJS(page, "button[type='submit'], .btn-primary, button");
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{}),
+        sleep(8000),
+      ]);
+      await dismissBanners(page);
+      await snap(page,"mt4_00c_myvip_after_login", shots, true);
     }
 
-    phase="iframe";
-    const frame = await getMyAccountFrame(page);
-    await snap(page,"mt4_05_iframe_loaded",shots);
+    // 2) CRM accounts
+    phase="goto-accounts"; log("PHASE:", phase);
+    await page.goto("https://webtrader7.avatrade.com/crm/accounts", { waitUntil:"domcontentloaded", timeout:90000 });
+    await dismissBanners(page);
+    await snap(page,"mt4_01_accounts", shots, true);
 
-    phase="hover-add";
+    // dobrodošlica / reklame (X)
+    await dismissBanners(page);
+    await sleep(600);
+
+    // 3) iframe
+    phase="iframe"; log("PHASE:", phase);
+    const frame = await getMyAccountFrame(page);
+    await snap(page,"mt4_02_iframe_loaded", shots);
+
+    // 4) + Add an Account → Demo Account
+    phase="add-account"; log("PHASE:", phase);
     const hovered = await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, true);
-    await snap(page,"mt4_06_hover_add",shots);
     if(!hovered) await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, false);
     await sleep(500);
-
-    phase="click-demo";
     await clickByText(frame, ["button","a","div","span"], /Demo Account/i, false);
-    await snap(page,"mt4_07_click_demo",shots,true);
+    await snap(page,"mt4_03_click_demo", shots, true);
 
-    phase="set-dropdowns";
+    // 5) set CFD - MT4 + EUR
+    phase="set-dropdowns"; log("PHASE:", phase);
     await frame.waitForSelector("body", { timeout: 90000 });
     await selectOptionByText(frame, "CFD - MT4");
     await selectOptionByText(frame, "EUR");
-    await snap(page,"mt4_08_dropdowns_set",shots);
+    await snap(page,"mt4_04_dropdowns", shots);
 
-    phase="submit";
+    // 6) Submit
+    phase="submit"; log("PHASE:", phase);
     await clickByText(frame, ["button","a"], /^Submit$/i, false);
     await sleep(2500);
-    await snap(page,"mt4_09_after_submit",shots,true);
+    await snap(page,"mt4_05_after_submit", shots, true);
 
-    phase="extract";
+    // 7) Extract login iz rezultata (iframe ili parent)
+    phase="extract"; log("PHASE:", phase);
     const credText = await frame.evaluate(()=>document.body?.innerText || "");
     let login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
-    if(!login){ const mt = await extractPageInfo(page); login = mt.login || null; }
-    await snap(page,`mt4_10_result_${login? "ok":"miss"}`,shots,true);
+    if(!login){
+      const mt = await extractPageInfo(page);
+      login = mt.login || null;
+    }
+    await snap(page,`mt4_06_result_${login? "ok":"miss"}`, shots, true);
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
     const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
@@ -561,10 +469,10 @@ app.post("/create-mt4", async (req, res) => {
   }
 });
 
-// health
+/* --------------------- basic routes --------------------- */
 app.get("/", (_req,res)=>res.send("AvaTrade Demo Service live"));
 
-// static shots
+// GET /shots/<filename.png>
 app.use("/shots", (req,res)=>{
   const filename = req.path.replace(/^\/+/, "");
   if(!/\.png$/i.test(filename)) return res.status(400).send("bad file");
