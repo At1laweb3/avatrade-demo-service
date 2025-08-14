@@ -332,7 +332,7 @@ app.post("/create-demo", async (req,res)=>{
 // ------------- MT4 -------------
 async function closeModals(page){
   await page.evaluate(()=>{
-    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
+    for(const sel of ["button[aria-label='Close']", ".modal-header .close", "button.close", "[data-dismiss='modal']"]){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
@@ -407,6 +407,54 @@ async function ensureAccountsUI(page, shots){
   throw new Error("accounts UI not available");
 }
 
+// === NEW HELPERS FOR CREDENTIALS ===
+async function innerText(ctx){
+  try { return await ctx.evaluate(() => document.body?.innerText || ""); }
+  catch { return ""; }
+}
+
+async function readLoginFromAnywhere(ctx){
+  const out = { login:null, server:null };
+  let txt = await innerText(ctx);
+
+  let m = txt.match(/Login\s*:\s*(\d{6,12})/i);
+  if (m) out.login = m[1];
+  let s = txt.match(/Server\s*:\s*([A-Za-z0-9._\-\s]+?(?:Demo|Live)?)/i);
+  if (s) out.server = (s[1] || "").trim();
+  if (out.login) return out;
+
+  try {
+    const guess = await ctx.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll("*"))
+        .filter(n => /login/i.test(n.textContent || ""));
+      for (const n of nodes){
+        const m2 = (n.textContent || "").match(/(\d{6,12})/);
+        if (m2) return { login: m2[1] };
+      }
+      return null;
+    });
+    if (guess?.login) out.login = guess.login;
+  } catch {}
+
+  return out;
+}
+
+async function goAccountsAndDetectUI(page, shots){
+  await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
+  await waitSpinnerGone(page, 20000);
+  await snap(page,"mt4_01_accounts",shots,true);
+  await dismissBanners(page);
+  await closeModals(page);
+  const ui = await ensureAccountsUI(page, shots);
+  let frame = null;
+  if (ui.mode === "iframe") {
+    frame = ui.frame;
+    if (!frame) throw new Error("accounts iframe not found");
+  }
+  return { mode: ui.mode, frame };
+}
+// === END NEW HELPERS ===
+
 async function clickByText(pageOrFrame, selectors, regex, hover=false){
   const res = await pageOrFrame.evaluate((sels, pattern, hov)=>{
     const rx = new RegExp(pattern,"i");
@@ -458,8 +506,8 @@ async function loginMyVip(page, shots, email, password){
   await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf");
   await snap(page,"mt4_00_myvip",shots,true);
 
-  const emailChoices = ["input[type='email']","input[name='email']","#email","input[name='username']","input[name='Email']"];
-  const passChoices  = ["input[type='password']","input[name='password']","#password","input[name='Password']"];
+  const emailChoices = ["input[type='email']", "input[name='email']", "#email", "input[name='username']", "input[name='Email']"];
+  const passChoices  = ["input[type='password']", "input[name='password']", "#password", "input[name='Password']"];
 
   for(let i=0;i<3;i++){
     try{
@@ -535,15 +583,24 @@ app.post("/create-mt4", async (req,res)=>{
       await snap(page,"mt4_08_set_iframe",shots);
 
       await clickByText(frame, ["button","a"], /^Submit$/i, false);
-      await sleep(2500);
+      await waitSpinnerGone(page, 20000);
       await snap(page,"mt4_09_after_submit_iframe",shots,true);
 
-      const credText = await frame.evaluate(()=>document.body?.innerText || "");
-      let mt4Login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
-      if(!mt4Login){
-        const mt = await extractPageInfo(page);
-        mt4Login = mt.login || null;
+      // 1) pokušaj odmah u iframe-u
+      let creds = await readLoginFromAnywhere(frame);
+      let mt4Login = creds.login || null;
+
+      // 2) ako nema – do 3 pokušaja preko "Accounts" liste (reload/return)
+      for (let tryNo = 1; !mt4Login && tryNo <= 3; tryNo++){
+        const ui2 = await goAccountsAndDetectUI(page, shots);
+        if (ui2.mode === "iframe") {
+          creds = await readLoginFromAnywhere(ui2.frame);
+        } else {
+          creds = await readLoginFromAnywhere(page);
+        }
+        mt4Login = creds.login || null;
       }
+
       await snap(page,`mt4_10_result_${mt4Login? "ok":"miss"}`,shots,true);
 
       const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
@@ -571,12 +628,21 @@ app.post("/create-mt4", async (req,res)=>{
     ]);
     await snap(page,"mt4_spa_after_submit",shots,true);
 
-    let txt = await page.evaluate(()=>document.body?.innerText || "");
-    let mt4Login = (txt.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
-    if(!mt4Login){
-      const mt = await extractPageInfo(page);
-      mt4Login = mt.login || null;
+    // 1) odmah na SPA stranici
+    let creds = await readLoginFromAnywhere(page);
+    let mt4Login = creds.login || null;
+
+    // 2) ako nema – do 3 pokušaja preko "Accounts"
+    for (let tryNo = 1; !mt4Login && tryNo <= 3; tryNo++){
+      const ui2 = await goAccountsAndDetectUI(page, shots);
+      if (ui2.mode === "iframe") {
+        creds = await readLoginFromAnywhere(ui2.frame);
+      } else {
+        creds = await readLoginFromAnywhere(page);
+      }
+      mt4Login = creds.login || null;
     }
+
     await snap(page,`mt4_spa_result_${mt4Login? "ok":"miss"}`,shots,true);
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
