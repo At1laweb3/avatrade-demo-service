@@ -280,7 +280,6 @@ app.post("/create-demo", async (req,res)=>{
     browser = launched.browser;
     page = await browser.newPage();
 
-    // proxy auth (ako je potrebno)
     if(launched.proxyAuth){
       await page.authenticate(launched.proxyAuth).catch(()=>{});
     }
@@ -353,7 +352,7 @@ app.post("/create-demo", async (req,res)=>{
 // ------------- MT4 -------------
 async function closeModals(page){
   await page.evaluate(()=>{
-    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
+    for(const sel of ["button[aria-label='Close']", ".modal-header .close", "button.close", "[data-dismiss='modal']"]){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
@@ -363,7 +362,7 @@ async function closeModals(page){
 }
 async function closeModalsInFrame(frame){
   await frame.evaluate(()=>{
-    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
+    for(const sel of ["button[aria-label='Close']", ".modal-header .close", "button.close", "[data-dismiss='modal']"]){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
@@ -494,6 +493,27 @@ async function waitForLoginText(ctx, maxMs=90000){
   return null;
 }
 
+// ---------- NOVO: robustan re-attach i šire parsiranje ----------
+async function reacquireAccountsCtx(page, shots, tag="reacq"){
+  let frame = await findAccountsFrame(page);
+  if(frame){
+    await closeModalsInFrame(frame);
+    await snap(page, `mt4_ctx_${tag}_iframe`, shots);
+    return { ctx: frame, kind: "iframe" };
+  }
+  await closeModals(page);
+  await snap(page, `mt4_ctx_${tag}_spa`, shots);
+  return { ctx: page, kind: "spa" };
+}
+async function scrapeAnyLogin(ctx){
+  const t = await ctx.evaluate(()=>document.body?.innerText || "");
+  let m =
+    t.match(/Login\s*:\s*(\d{6,12})/i) ||
+    t.match(/Account\s*#\s*(\d{6,12})/i) ||
+    t.match(/\b(\d{6,12})\b(?=[\s\S]{0,80}MT4)/i);
+  return m ? m[1] : null;
+}
+
 async function loginMyVip(page, shots, email, password){
   log("PHASE: myvip-login");
   await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf_nav");
@@ -562,7 +582,7 @@ app.post("/create-mt4", async (req,res)=>{
     let ui = await ensureAccountsUI(page, shots);
 
     if(ui.mode==="iframe"){
-      const frame = ui.frame;
+      let frame = ui.frame;
       await closeModalsInFrame(frame);
 
       // Add an Account -> Demo -> CFD-MT4 -> EUR -> Submit
@@ -580,25 +600,37 @@ app.post("/create-mt4", async (req,res)=>{
 
       await clickByText(frame, ["button","a"], /^Submit$/i, false);
 
-      // *** NOVO: čekamo kredencijale do 90s u istom iframe-u ***
+      // Čekanje iza submit-a – iframе ponekad radi reload -> re-attach loop
       await Promise.race([ waitNetworkQuiet(page, {idleMs:800, timeoutMs:45000}), sleep(45000) ]);
       await snap(page,"mt4_09_after_submit_iframe",shots,true);
 
-      let mt4Login = await waitForLoginText(frame, 90000);
-      if(!mt4Login){
-        // probaj i na parent stranici (ponekad modal prebaci prikaz)
-        mt4Login = await waitForLoginText(page, 30000);
+      let ctx = frame;
+      let mt4Login = null;
+      const t0 = Date.now();
+
+      while (!mt4Login && Date.now() - t0 < 90000) {
+        try {
+          mt4Login = await waitForLoginText(ctx, 2500);
+          if (!mt4Login) mt4Login = await scrapeAnyLogin(ctx);
+        } catch (e) {
+          if (String(e).match(/Execution context|detached|Cannot find context/i)) {
+            const reacq = await reacquireAccountsCtx(page, shots, "loop");
+            ctx = reacq.ctx;
+          } else {
+            await sleep(800);
+          }
+        }
+        if (!mt4Login) await sleep(1200);
       }
 
-      // Fallback: reotvori /crm/accounts i pokušaj ponovo da pročitaš "Login:"
+      // Fallback – reotvori /crm/accounts i pokušaj ponovo
       if(!mt4Login){
         await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav_nav");
         await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
-        await snap(page,"mt4_01_accounts",shots,true);
-        ui = await ensureAccountsUI(page, shots);
-
-        const ctx = ui.mode==="iframe" ? ui.frame : page;
-        mt4Login = await waitForLoginText(ctx, 60000);
+        const reacq = await reacquireAccountsCtx(page, shots, "final");
+        const ctx2 = reacq.ctx;
+        mt4Login = await waitForLoginText(ctx2, 40000);
+        if(!mt4Login) mt4Login = await scrapeAnyLogin(ctx2);
       }
 
       await snap(page,`mt4_10_result_${mt4Login? "ok":"miss"}`,shots,true);
