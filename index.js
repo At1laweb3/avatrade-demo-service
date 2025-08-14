@@ -311,7 +311,7 @@ app.post("/create-demo", async (req,res)=>{
 async function closeModals(page){
   await page.evaluate(()=>{
     // welcome modal
-    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
+    for(const sel of ["button[aria-label='Close']", ".modal-header .close", "button.close", "[data-dismiss='modal']"]){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
@@ -501,16 +501,16 @@ app.post("/create-mt4", async (req,res)=>{
       await snap(page,"mt4_09_after_submit_iframe",shots,true);
 
       const credText = await frame.evaluate(()=>document.body?.innerText || "");
-      var login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
-      if(!login){
+      let mt4Login = (credText.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
+      if(!mt4Login){
         const mt = await extractPageInfo(page);
-        login = mt.login || null;
+        mt4Login = mt.login || null;
       }
-      await snap(page,`mt4_10_result_${login? "ok":"miss"}`,shots,true);
+      await snap(page,`mt4_10_result_${mt4Login? "ok":"miss"}`,shots,true);
 
       const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
       const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
-      return res.json({ ok: !!login, mt4_login: login, screenshots: screenshot_urls });
+      return res.json({ ok: !!mt4Login, mt4_login: mt4Login, screenshots: screenshot_urls });
     }
 
     // ---- SPA (bez iframe-a) ----
@@ -532,16 +532,16 @@ app.post("/create-mt4", async (req,res)=>{
 
     // čitanje logina sa stranice
     let txt = await page.evaluate(()=>document.body?.innerText || "");
-    let login = (txt.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
-    if(!login){
+    let mt4Login = (txt.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
+    if(!mt4Login){
       const mt = await extractPageInfo(page);
-      login = mt.login || null;
+      mt4Login = mt.login || null;
     }
-    await snap(page,`mt4_spa_result_${login? "ok":"miss"}`,shots,true);
+    await snap(page,`mt4_spa_result_${mt4Login? "ok":"miss"}`,shots,true);
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
     const screenshot_urls = shots.map(f => `${baseUrl}/shots/${encodeURIComponent(f)}`);
-    return res.json({ ok: !!login, mt4_login: login, screenshots: screenshot_urls });
+    return res.json({ ok: !!mt4Login, mt4_login: mt4Login, screenshots: screenshot_urls });
 
   }catch(e){
     console.error("create-mt4 error:", e?.message || e, "AT PHASE:", phase);
