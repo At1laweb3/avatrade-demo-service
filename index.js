@@ -1,4 +1,4 @@
-// index.js — AvaTrade DEMO + MT4 (robust, CF-bypass, screenshots u /shots)
+// index.js — AvaTrade DEMO + MT4 (robust, CF-bypass, spinner+SPA/iframe autodetect, screenshots u /shots)
 // DEBUG_SCREENSHOTS=1 => čuva PNG i loguje "SNAP: <ime>"
 
 import express from "express";
@@ -43,7 +43,6 @@ async function snap(page, label, shots, full=false){
   }catch{}
 }
 
-// tiny helpers
 async function clickJS(ctx, selector){
   const ok = await ctx.evaluate(sel=>{
     const el = document.querySelector(sel);
@@ -78,7 +77,7 @@ async function dismissBanners(page){
   });
 }
 
-// ---- Cloudflare-aware goto (sa reload petljom) ----
+// ---- Cloudflare-aware goto ----
 async function gotoWithCF(page, url, shots, prefix, maxTries=8){
   for(let i=1;i<=maxTries;i++){
     await page.goto(url, { waitUntil:"domcontentloaded", timeout:90000 });
@@ -88,9 +87,7 @@ async function gotoWithCF(page, url, shots, prefix, maxTries=8){
     const txt = await page.evaluate(()=>document.body?.innerText || "");
     if (/unblock challenges\.cloudflare\.com/i.test(txt)) { await sleep(2500); continue; }
     if (/Verifying you are human|needs to review the security/i.test(txt)) { await sleep(3000); continue; }
-
-    // prošli smo CF
-    return true;
+    return true; // passed CF
   }
   return false;
 }
@@ -296,7 +293,6 @@ app.post("/create-demo", async (req,res)=>{
 
   }catch(e){
     console.error("create-demo error:", e?.message || e, "AT PHASE:", phase);
-    // po zahtevu: i u grešci teramo dalje na MT4
     return res.status(200).json({ ok:true, note:`force-continue (${phase})`, screenshots:[] });
   }finally{
     try{ await browser?.close(); }catch{}
@@ -310,17 +306,26 @@ async function closeModals(page){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
-    const dlg = document.querySelector("[role='dialog']");
-    if(dlg){ dlg.style.display="none"; }
+    const overlays = Array.from(document.querySelectorAll("[class*='backdrop'],[class*='overlay'],.modal-backdrop,[role='dialog']"));
+    overlays.forEach(el=>{ el.style.display="none"; });
   });
 }
 
+async function waitUntilAccountsText(page, ms=60000){
+  const start=Date.now();
+  while(Date.now()-start<ms){
+    const txt = await page.evaluate(()=>document.body?.innerText || "");
+    if(/My Account|Add an Account|Demo Account/i.test(txt)) return true;
+    await sleep(800);
+  }
+  return false;
+}
 async function waitSpinnerGone(page, ms=30000){
   const start=Date.now();
   while(Date.now()-start<ms){
     const has = await page.evaluate(()=>{
       const sel=[".spinner",".loading",".lds-ring",".lds-roller",".preloader",".MuiBackdrop-root",".ant-spin",
-                 '[class*="spinner"]','[class*="Loader"]','[class*="loading"]'];
+                 "[class*='spinner']","[class*='loader']","[class*='loading']","[class*='Backdrop']"];
       return sel.some(s=> document.querySelector(s));
     });
     if(!has) return true;
@@ -328,38 +333,51 @@ async function waitSpinnerGone(page, ms=30000){
   }
   return false;
 }
+async function findAccountsFrame(page){
+  for(let i=0;i<10;i++){
+    const fr = page.frames().find(f => /avacrm|crm/i.test(f.url()));
+    if(fr) return fr;
+    await sleep(500);
+  }
+  return null;
+}
 
 async function ensureAccountsUI(page, shots){
-  // najpre: pokušaj direktno
-  let iframe = await page.$('#my_account, iframe[src*="avacrm"]');
-  if(iframe) return { mode:"iframe", handle: iframe };
+  // pokušaj direktno
+  let frame = await findAccountsFrame(page);
+  if(frame) return { mode:"iframe", frame };
 
   let hasAdd = await page.evaluate(()=>{
     return Array.from(document.querySelectorAll("button,a,div[role='button']"))
       .some(b=>/\+\s*Add an Account|Add an Account/i.test(b.textContent||""));
   });
-  if(hasAdd) return { mode:"spa", handle: null };
+  if(hasAdd) return { mode:"spa", frame:null };
 
-  // čekaj spinner pa reload do 3x
+  // do 3 ciklusa: čekaj spinner -> čekaj tekst -> reload
   for(let i=1;i<=3;i++){
-    await waitSpinnerGone(page, 15000);
+    await waitSpinnerGone(page, 20000);
+    await closeModals(page);
     await snap(page,`mt4_iframe_retry_${i}`,shots);
-    iframe = await page.$('#my_account, iframe[src*="avacrm"]');
-    if(iframe) return { mode:"iframe", handle: iframe };
+
+    frame = await findAccountsFrame(page);
+    if(frame) return { mode:"iframe", frame };
 
     hasAdd = await page.evaluate(()=>{
       return Array.from(document.querySelectorAll("button,a,div[role='button']"))
         .some(b=>/\+\s*Add an Account|Add an Account/i.test(b.textContent||""));
     });
-    if(hasAdd) return { mode:"spa", handle: null };
+    if(hasAdd) return { mode:"spa", frame:null };
 
+    const gotText = await waitUntilAccountsText(page, 10000);
+    if(gotText){
+      // tekst tu, ali ni iframe ni dugme — probaj opet
+      frame = await findAccountsFrame(page);
+      if(frame) return { mode:"iframe", frame };
+    }
     await page.reload({waitUntil:"domcontentloaded"}).catch(()=>{});
+    await dismissBanners(page);
   }
   throw new Error("accounts UI not available");
-}
-
-async function getFrameFromHandle(handle){
-  try{ const f = await handle.contentFrame(); return f || null; }catch{ return null; }
 }
 
 async function clickByText(pageOrFrame, selectors, regex, hover=false){
@@ -386,7 +404,6 @@ async function clickByText(pageOrFrame, selectors, regex, hover=false){
 }
 
 async function selectOptionGeneric(pageOrFrame, wanted){
-  // <select>
   const okSelect = await pageOrFrame.evaluate((txt)=>{
     const sels = Array.from(document.querySelectorAll("select"));
     for(const s of sels){
@@ -397,7 +414,6 @@ async function selectOptionGeneric(pageOrFrame, wanted){
   }, wanted);
   if(okSelect) return true;
 
-  // custom dropdown
   await pageOrFrame.evaluate(()=>{
     const toggles = Array.from(document.querySelectorAll("[role='combobox'], .Select-control, .dropdown, .select, .v-select, .css-1hwfws3, .css-1wa3eu0-placeholder, .ant-select-selector"));
     const t = toggles.find(x=> !!(x.offsetParent || (x.getClientRects && x.getClientRects().length)));
@@ -413,10 +429,8 @@ async function selectOptionGeneric(pageOrFrame, wanted){
 async function loginMyVip(page, shots, email, password){
   log("PHASE: myvip-login");
   await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf");
-
   await snap(page,"mt4_00_myvip",shots,true);
 
-  // login forma (fallback selektori + do 3 reloada)
   const emailChoices = ["input[type='email']","input[name='email']","#email","input[name='username']","input[name='Email']"];
   const passChoices  = ["input[type='password']","input[name='password']","#password","input[name='Password']"];
 
@@ -438,7 +452,6 @@ async function loginMyVip(page, shots, email, password){
       await snap(page,`mt4_00b_myvip_reload_${i+1}`,shots);
     }
   }
-  // ako i posle 3 pokušaja nema forme, nastavi (SSO ponekad već uloguje)
 }
 
 app.post("/create-mt4", async (req,res)=>{
@@ -467,18 +480,20 @@ app.post("/create-mt4", async (req,res)=>{
     // 2) accounts
     phase="goto-accounts";
     await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
-    await waitSpinnerGone(page, 20000);
-    await snap(page,"mt4_01_accounts",shots,true);
+    await Promise.race([
+      page.waitForNetworkIdle({idleTime:1000, timeout:60000}).catch(()=>{}),
+      sleep(6000),
+    ]);
     await dismissBanners(page);
     await closeModals(page);
+    await snap(page,"mt4_01_accounts",shots,true);
 
     // 3) UI detect
     phase="iframe";
     const ui = await ensureAccountsUI(page, shots);
 
     if(ui.mode==="iframe"){
-      const frame = await getFrameFromHandle(ui.handle);
-      if(!frame) throw new Error("accounts iframe not found");
+      const frame = ui.frame;
 
       await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, true);
       await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, false);
@@ -523,10 +538,12 @@ app.post("/create-mt4", async (req,res)=>{
     await snap(page,"mt4_spa_set_dds",shots);
 
     await clickByText(page, ["button","a"], /^Submit$/i, false);
-    await waitSpinnerGone(page, 15000);
+    await Promise.race([
+      page.waitForNetworkIdle({idleTime:1000, timeout:30000}).catch(()=>{}),
+      sleep(3000),
+    ]);
     await snap(page,"mt4_spa_after_submit",shots,true);
 
-    // čitanje logina sa stranice
     let txt = await page.evaluate(()=>document.body?.innerText || "");
     let mt4Login = (txt.match(/Login\s*:\s*(\d{6,12})/i)||[])[1] || null;
     if(!mt4Login){
