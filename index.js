@@ -1,5 +1,5 @@
-// index.js — AvaTrade DEMO + MT4 (CTA-click, CF-bypass, spinner+SPA/iframe autodetect, any-frame credential scan)
-// DEBUG_SCREENSHOTS=1 => čuva PNG u root folderu i loguje "SNAP: <ime>"
+// index.js — AvaTrade DEMO + MT4 (robust, CF-bypass, spinner+SPA/iframe autodetect, screenshots u /shots)
+// DEBUG_SCREENSHOTS=1 => čuva PNG i loguje "SNAP: <ime>"
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -12,27 +12,45 @@ app.use(express.json());
 const SHARED_SECRET = process.env.PUPPETEER_SHARED_SECRET || "superSecret123";
 const PORT = process.env.PORT || 3000;
 const DEBUG = process.env.DEBUG_SCREENSHOTS === "1";
+const PERSIST = process.env.PERSIST_PROFILE === "1";
+const PROXY = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
 
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 const log = (...a)=>console.log(...a);
 function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19); }
 
 // ---------- LAUNCH ----------
+function parseProxyAuth(urlStr){
+  try{
+    const u = new URL(urlStr);
+    const hasAuth = u.username || u.password;
+    return { server: `${u.protocol}//${u.hostname}:${u.port}`, auth: hasAuth ? {username: decodeURIComponent(u.username||""), password: decodeURIComponent(u.password||"")} : null };
+  }catch{ return null; }
+}
+
 async function launchBrowser(){
-  return await puppeteer.launch({
+  const args = [
+    "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+    "--disable-gpu","--no-zygote","--window-size=1280,1000",
+    "--renderer-process-limit=1","--js-flags=--max-old-space-size=256",
+    "--no-first-run","--no-default-browser-check",
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,site-per-process,IsolateOrigins",
+    "--disable-blink-features=AutomationControlled",
+  ];
+  let proxyAuth = null;
+  if(PROXY){
+    const p = parseProxyAuth(PROXY);
+    if(p){ args.push(`--proxy-server=${p.server}`); proxyAuth = p.auth; }
+  }
+  const launchOpts = {
     headless: "new",
-    userDataDir: process.env.PERSIST_PROFILE === "1" ? "/tmp/avatrade-profile" : undefined,
-    args: [
-      ...(process.env.HTTP_PROXY ? [`--proxy-server=${process.env.HTTP_PROXY}`] : []),
-      "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
-      "--disable-gpu","--no-zygote","--window-size=1280,1000",
-      "--renderer-process-limit=1","--js-flags=--max-old-space-size=256",
-      "--no-first-run","--no-default-browser-check",
-      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,site-per-process,IsolateOrigins",
-      "--disable-blink-features=AutomationControlled",
-    ],
+    args,
     defaultViewport: { width:1280, height:1000 },
-  });
+  };
+  if(PERSIST) launchOpts.userDataDir = "/tmp/pupp_profile";
+
+  const browser = await puppeteer.launch(launchOpts);
+  return { browser, proxyAuth };
 }
 
 async function snap(page, label, shots, full=false){
@@ -66,19 +84,6 @@ async function typeJS(ctx, selector, value){
   }, selector, value);
 }
 
-// banners / popups
-async function dismissBanners(page){
-  await page.evaluate(()=>{
-    const btn = Array.from(document.querySelectorAll("button, a, div[role='button']"))
-      .find(b=>/accept|allow|ok|got it|agree/i.test(b.textContent||""));
-    if(btn) btn.click();
-    const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
-    if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
-    const pop = document.getElementById("solitics-popup-maker");
-    if(pop) pop.style.display="none";
-  });
-}
-
 // ---- network idle helper ----
 async function waitNetworkQuiet(page, { idleMs=1000, timeoutMs=60000 } = {}){
   return new Promise(resolve=>{
@@ -103,11 +108,23 @@ async function waitNetworkQuiet(page, { idleMs=1000, timeoutMs=60000 } = {}){
     page.on("request", onReq);
     page.on("requestfinished", onDone);
     page.on("requestfailed", onDone);
+
     kickIdle();
   });
 }
 
-// ---- Cloudflare-aware goto ----
+// ---- CF-aware goto ----
+async function dismissBanners(page){
+  await page.evaluate(()=>{
+    const btn = Array.from(document.querySelectorAll("button, a, div[role='button']"))
+      .find(b=>/accept|allow|ok|got it/i.test(b.textContent||""));
+    if(btn) btn.click();
+    const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
+    if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
+    const pop = document.getElementById("solitics-popup-maker");
+    if(pop) pop.style.display="none";
+  });
+}
 async function gotoWithCF(page, url, shots, prefix, maxTries=8){
   for(let i=1;i<=maxTries;i++){
     await page.goto(url, { waitUntil:"domcontentloaded", timeout:90000 });
@@ -117,7 +134,7 @@ async function gotoWithCF(page, url, shots, prefix, maxTries=8){
     const txt = await page.evaluate(()=>document.body?.innerText || "");
     if (/unblock challenges\.cloudflare\.com/i.test(txt)) { await sleep(2500); continue; }
     if (/Verifying you are human|needs to review the security/i.test(txt)) { await sleep(3000); continue; }
-    return true; // passed CF
+    return true;
   }
   return false;
 }
@@ -213,6 +230,7 @@ async function extractPageInfo(page){
   if(out.login && out.server) out.found = true;
   return out;
 }
+
 async function waitForOutcome(page, maxMs=30000){
   const start = Date.now();
   const OK = [/Your Demo Account is Being Created/i,/congratulations/i,/account application has been approved/i,/webtrader login details/i,/trade on demo/i,/login details and platforms/i];
@@ -229,40 +247,20 @@ async function waitForOutcome(page, maxMs=30000){
 }
 
 // -------- DEMO --------
-// (CTA click → tek onda tražimo polja)
 async function smartGotoDemo(page, shots){
   const urls = [
     "https://www.avatrade.com/demo-account",
     "https://www.avatrade.com/trading-account/demo-trading-account",
   ];
-  const emailChoices = ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"];
-  const passChoices  = ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"];
-
   for(const url of urls){
     log("PHASE: goto ->", url);
-    await gotoWithCF(page, url, shots, "demo_nav_cf");
+    await gotoWithCF(page, url, shots, "demo_nav_cf_nav");
     await snap(page, "01_goto", shots, true);
-
-    // pokušaj odmah (možda je forma tu)
     try{
-      const emailSel = await waitForAny(page, emailChoices, 6000);
-      const passSel  = await waitForAny(page, passChoices, 6000);
+      const emailSel = await waitForAny(page, ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"], 15000);
+      const passSel  = await waitForAny(page, ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"], 15000);
       return { emailSel, passSel };
-    }catch{}
-
-    // klikni CTA pa čekaj polja
-    const clicked =
-      await clickByText(page, ["a","button","div[role='button']",".cta a",".cta button"],
-        /(practice\s*for\s*free|try\s*free\s*demo|open\s*demo\s*account|get\s*(your\s*)?free\s*demo|start\s*trading\s*on\s*demo)/i, false);
-    if(clicked){
-      await sleep(1500);
-      await dismissBanners(page);
-      try{
-        const emailSel = await waitForAny(page, emailChoices, 15000);
-        const passSel  = await waitForAny(page, passChoices, 15000);
-        return { emailSel, passSel };
-      }catch{}
-    }
+    }catch{ /* try next url */ }
   }
   throw new Error("none of selectors appeared: #input-email | input[type='email'] | input[name*='mail' i] | input[placeholder*='mail' i]");
 }
@@ -276,12 +274,23 @@ app.post("/create-demo", async (req,res)=>{
   const normPhone = normalizePhone(phone, defaultCc);
   const { rest } = splitIntl(normPhone);
 
-  let browser, phase="init"; const shots=[];
+  let browser, page, phase="init"; const shots=[];
   try{
-    browser = await launchBrowser();
-    const page = await browser.newPage();
+    const launched = await launchBrowser();
+    browser = launched.browser;
+    page = await browser.newPage();
 
-    // (ne preseci skripte – to ubija SPA)
+    // proxy auth (ako je potrebno)
+    if(launched.proxyAuth){
+      await page.authenticate(launched.proxyAuth).catch(()=>{});
+    }
+
+    await page.setRequestInterception(true);
+    page.on("request", req=>{
+      const u=req.url(); const t=req.resourceType();
+      if(t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
+      else req.continue();
+    });
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
@@ -306,10 +315,10 @@ app.post("/create-demo", async (req,res)=>{
         el.dispatchEvent(new Event("input",{bubbles:true}));
         el.dispatchEvent(new Event("change",{bubbles:true}));
       }
-      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(x=>/submit|sign up|start|create/i.test(x.textContent||""));
+      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(x=>/submit|sign up|start/i.test(x.textContent||""));
       if(b) b.removeAttribute("disabled");
     }, emailSel, passSel);
-    await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
+    await (clickJS(page, "button[type='submit']") || clickJS(page, "button"));
     await Promise.race([ sleep(8000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:20000}) ]);
     await snap(page, "04_after_submit", shots, true);
 
@@ -352,12 +361,22 @@ async function closeModals(page){
     overlays.forEach(el=>{ el.style.display="none"; });
   });
 }
+async function closeModalsInFrame(frame){
+  await frame.evaluate(()=>{
+    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
+      const b=document.querySelector(sel);
+      if(b){ b.click(); }
+    }
+    const overlays = Array.from(document.querySelectorAll("[class*='backdrop'],[class*='overlay'],.modal-backdrop,[role='dialog']"));
+    overlays.forEach(el=>{ el.style.display="none"; });
+  }).catch(()=>{});
+}
 
 async function waitUntilAccountsText(page, ms=60000){
   const start=Date.now();
   while(Date.now()-start<ms){
     const txt = await page.evaluate(()=>document.body?.innerText || "");
-    if(/My Account|Add an Account|Demo Account/i.test(txt)) return true;
+    if(/My Account|Add an Account|Demo Account|Trading Platforms/i.test(txt)) return true;
     await sleep(800);
   }
   return false;
@@ -376,14 +395,13 @@ async function waitSpinnerGone(page, ms=30000){
   return false;
 }
 async function findAccountsFrame(page){
-  for(let i=0;i<12;i++){
+  for(let i=0;i<20;i++){
     const fr = page.frames().find(f => /avacrm|crm/i.test(f.url()));
     if(fr) return fr;
     await sleep(500);
   }
   return null;
 }
-
 async function ensureAccountsUI(page, shots){
   let frame = await findAccountsFrame(page);
   if(frame) return { mode:"iframe", frame };
@@ -465,36 +483,20 @@ async function selectOptionGeneric(pageOrFrame, wanted){
   return await clickByText(pageOrFrame, ["li","div","span","button","a"], new RegExp(wanted,"i"));
 }
 
-// ——— helper: čitanje MT4 logina sa bilo kog frame-a ———
-async function readLoginFromAnyFrame(page){
-  const scan = async (ctx) => {
-    try {
-      const txt = await ctx.evaluate(() => document.body?.innerText || "");
-      const m = txt.match(/Login\s*:\s*(\d{6,12})/i);
-      if (m) return m[1];
-    } catch {}
-    return null;
-  };
-  for (const f of page.frames()){
-    const val = await scan(f);
-    if (val) return val;
+async function waitForLoginText(ctx, maxMs=90000){
+  const start = Date.now();
+  while(Date.now()-start < maxMs){
+    const t = await ctx.evaluate(()=>document.body?.innerText || "");
+    const m = t.match(/Login\s*:\s*(\d{6,12})/i);
+    if(m) return m[1];
+    await sleep(1500);
   }
-  return await scan(page);
-}
-
-// ——— helper: idi na Accounts i detektuj UI (za re-scan posle submit) ———
-async function goAccountsAndDetectUI(page, shots){
-  await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
-  await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
-  await dismissBanners(page);
-  await closeModals(page);
-  await snap(page,"mt4_01_accounts",shots,true);
-  return await ensureAccountsUI(page, shots);
+  return null;
 }
 
 async function loginMyVip(page, shots, email, password){
   log("PHASE: myvip-login");
-  await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf");
+  await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf_nav");
   await snap(page,"mt4_00_myvip",shots,true);
 
   const emailChoices = ["input[type='email']","input[name='email']","#email","input[name='username']","input[name='Email']"];
@@ -507,7 +509,10 @@ async function loginMyVip(page, shots, email, password){
       await typeJS(page, mailSel, email);
       await typeJS(page, passSel, password);
       await clickJS(page, "button[type='submit'], .btn, button");
-      await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
+      await Promise.race([
+        sleep(6000),
+        waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000})
+      ]);
       await snap(page,"mt4_00d_myvip_after_login",shots,true);
       return;
     }catch{
@@ -522,11 +527,21 @@ app.post("/create-mt4", async (req,res)=>{
   const { email, password } = req.body || {};
   if(!email || !password) return res.status(400).json({ ok:false, error:"Missing email/password" });
 
-  let browser; const shots=[]; let phase="init";
+  let browser, page; const shots=[]; let phase="init";
   try{
-    browser = await launchBrowser();
-    const page = await browser.newPage();
+    const launched = await launchBrowser();
+    browser = launched.browser;
+    page = await browser.newPage();
+    if(launched.proxyAuth){
+      await page.authenticate(launched.proxyAuth).catch(()=>{});
+    }
 
+    await page.setRequestInterception(true);
+    page.on("request", req=>{
+      const u=req.url(); const t=req.resourceType();
+      if(t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
+      else req.continue();
+    });
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
@@ -534,13 +549,23 @@ app.post("/create-mt4", async (req,res)=>{
     phase="myvip-login";
     await loginMyVip(page, shots, email, password);
 
-    // 2) accounts + detect UI
+    // 2) accounts
     phase="goto-accounts";
-    let ui = await goAccountsAndDetectUI(page, shots);
+    await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav_nav");
+    await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
+    await dismissBanners(page);
+    await closeModals(page);
+    await snap(page,"mt4_01_accounts",shots,true);
+
+    // 3) UI detect
+    phase="iframe";
+    let ui = await ensureAccountsUI(page, shots);
 
     if(ui.mode==="iframe"){
       const frame = ui.frame;
+      await closeModalsInFrame(frame);
 
+      // Add an Account -> Demo -> CFD-MT4 -> EUR -> Submit
       await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, true);
       await clickByText(frame, ["button","a","div","span"], /\+\s*Add an Account/i, false);
       await sleep(400);
@@ -554,16 +579,26 @@ app.post("/create-mt4", async (req,res)=>{
       await snap(page,"mt4_08_set_iframe",shots);
 
       await clickByText(frame, ["button","a"], /^Submit$/i, false);
-      await waitSpinnerGone(page, 30000);
+
+      // *** NOVO: čekamo kredencijale do 90s u istom iframe-u ***
+      await Promise.race([ waitNetworkQuiet(page, {idleMs:800, timeoutMs:45000}), sleep(45000) ]);
       await snap(page,"mt4_09_after_submit_iframe",shots,true);
 
-      // pokušaj više puta da pročitaš login iz bilo kog frame-a / liste
-      let mt4Login = null;
-      for (let i=0; i<3 && !mt4Login; i++){
-        mt4Login = await readLoginFromAnyFrame(page);
-        if (mt4Login) break;
-        ui = await goAccountsAndDetectUI(page, shots);
-        await sleep(1500);
+      let mt4Login = await waitForLoginText(frame, 90000);
+      if(!mt4Login){
+        // probaj i na parent stranici (ponekad modal prebaci prikaz)
+        mt4Login = await waitForLoginText(page, 30000);
+      }
+
+      // Fallback: reotvori /crm/accounts i pokušaj ponovo da pročitaš "Login:"
+      if(!mt4Login){
+        await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav_nav");
+        await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
+        await snap(page,"mt4_01_accounts",shots,true);
+        ui = await ensureAccountsUI(page, shots);
+
+        const ctx = ui.mode==="iframe" ? ui.frame : page;
+        mt4Login = await waitForLoginText(ctx, 60000);
       }
 
       await snap(page,`mt4_10_result_${mt4Login? "ok":"miss"}`,shots,true);
@@ -590,12 +625,10 @@ app.post("/create-mt4", async (req,res)=>{
     await Promise.race([ sleep(3000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:30000}) ]);
     await snap(page,"mt4_spa_after_submit",shots,true);
 
-    let mt4Login = null;
-    for (let i=0; i<3 && !mt4Login; i++){
-      mt4Login = await readLoginFromAnyFrame(page);
-      if (mt4Login) break;
-      await goAccountsAndDetectUI(page, shots);
-      await sleep(1500);
+    let mt4Login = await waitForLoginText(page, 90000);
+    if(!mt4Login){
+      const mt = await extractPageInfo(page);
+      mt4Login = mt.login || null;
     }
     await snap(page,`mt4_spa_result_${mt4Login? "ok":"miss"}`,shots,true);
 
