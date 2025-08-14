@@ -1,5 +1,5 @@
-// index.js — AvaTrade DEMO + MT4 (robust, CF-bypass, spinner+SPA/iframe autodetect, screenshots u /shots)
-// DEBUG_SCREENSHOTS=1 => čuva PNG i loguje "SNAP: <ime>"
+// index.js — AvaTrade DEMO + MT4 (CTA-click, CF-bypass, spinner+SPA/iframe autodetect, any-frame credential scan)
+// DEBUG_SCREENSHOTS=1 => čuva PNG u root folderu i loguje "SNAP: <ime>"
 
 import express from "express";
 import puppeteer from "puppeteer";
@@ -21,7 +21,9 @@ function ts(){ return new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
 async function launchBrowser(){
   return await puppeteer.launch({
     headless: "new",
+    userDataDir: process.env.PERSIST_PROFILE === "1" ? "/tmp/avatrade-profile" : undefined,
     args: [
+      ...(process.env.HTTP_PROXY ? [`--proxy-server=${process.env.HTTP_PROXY}`] : []),
       "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
       "--disable-gpu","--no-zygote","--window-size=1280,1000",
       "--renderer-process-limit=1","--js-flags=--max-old-space-size=256",
@@ -68,7 +70,7 @@ async function typeJS(ctx, selector, value){
 async function dismissBanners(page){
   await page.evaluate(()=>{
     const btn = Array.from(document.querySelectorAll("button, a, div[role='button']"))
-      .find(b=>/accept|allow|ok|got it/i.test(b.textContent||""));
+      .find(b=>/accept|allow|ok|got it|agree/i.test(b.textContent||""));
     if(btn) btn.click();
     const x = document.querySelector("#solitics-popup-maker .solitics-close-button");
     if(x) x.dispatchEvent(new MouseEvent("click",{bubbles:true}));
@@ -77,7 +79,7 @@ async function dismissBanners(page){
   });
 }
 
-// ---- network idle helper (zamenjuje Playwright-ov page.waitForNetworkIdle) ----
+// ---- network idle helper ----
 async function waitNetworkQuiet(page, { idleMs=1000, timeoutMs=60000 } = {}){
   return new Promise(resolve=>{
     let inflight = 0;
@@ -101,8 +103,6 @@ async function waitNetworkQuiet(page, { idleMs=1000, timeoutMs=60000 } = {}){
     page.on("request", onReq);
     page.on("requestfinished", onDone);
     page.on("requestfailed", onDone);
-
-    // start odmah pokušajem idle-a
     kickIdle();
   });
 }
@@ -229,20 +229,40 @@ async function waitForOutcome(page, maxMs=30000){
 }
 
 // -------- DEMO --------
+// (CTA click → tek onda tražimo polja)
 async function smartGotoDemo(page, shots){
   const urls = [
     "https://www.avatrade.com/demo-account",
     "https://www.avatrade.com/trading-account/demo-trading-account",
   ];
+  const emailChoices = ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"];
+  const passChoices  = ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"];
+
   for(const url of urls){
     log("PHASE: goto ->", url);
     await gotoWithCF(page, url, shots, "demo_nav_cf");
     await snap(page, "01_goto", shots, true);
+
+    // pokušaj odmah (možda je forma tu)
     try{
-      const emailSel = await waitForAny(page, ["#input-email","input[type='email']","input[name*='mail' i]","input[placeholder*='mail' i]"], 15000);
-      const passSel  = await waitForAny(page, ["#input-password","input[type='password']","input[name*='pass' i]","input[placeholder*='password' i]"], 15000);
+      const emailSel = await waitForAny(page, emailChoices, 6000);
+      const passSel  = await waitForAny(page, passChoices, 6000);
       return { emailSel, passSel };
-    }catch{ /* try next url */ }
+    }catch{}
+
+    // klikni CTA pa čekaj polja
+    const clicked =
+      await clickByText(page, ["a","button","div[role='button']",".cta a",".cta button"],
+        /(practice\s*for\s*free|try\s*free\s*demo|open\s*demo\s*account|get\s*(your\s*)?free\s*demo|start\s*trading\s*on\s*demo)/i, false);
+    if(clicked){
+      await sleep(1500);
+      await dismissBanners(page);
+      try{
+        const emailSel = await waitForAny(page, emailChoices, 15000);
+        const passSel  = await waitForAny(page, passChoices, 15000);
+        return { emailSel, passSel };
+      }catch{}
+    }
   }
   throw new Error("none of selectors appeared: #input-email | input[type='email'] | input[name*='mail' i] | input[placeholder*='mail' i]");
 }
@@ -261,12 +281,7 @@ app.post("/create-demo", async (req,res)=>{
     browser = await launchBrowser();
     const page = await browser.newPage();
 
-    await page.setRequestInterception(true);
-    page.on("request", req=>{
-      const u=req.url(); const t=req.resourceType();
-      if(t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
-      else req.continue();
-    });
+    // (ne preseci skripte – to ubija SPA)
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
@@ -291,14 +306,11 @@ app.post("/create-demo", async (req,res)=>{
         el.dispatchEvent(new Event("input",{bubbles:true}));
         el.dispatchEvent(new Event("change",{bubbles:true}));
       }
-      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(x=>/submit|sign up|start/i.test(x.textContent||""));
+      const b=document.querySelector("button[type='submit']") || Array.from(document.querySelectorAll("button")).find(x=>/submit|sign up|start|create/i.test(x.textContent||""));
       if(b) b.removeAttribute("disabled");
     }, emailSel, passSel);
     await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
-    await Promise.race([
-      sleep(8000),
-      waitNetworkQuiet(page, {idleMs:800, timeoutMs:20000})
-    ]);
+    await Promise.race([ sleep(8000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:20000}) ]);
     await snap(page, "04_after_submit", shots, true);
 
     phase="outcome";
@@ -332,7 +344,7 @@ app.post("/create-demo", async (req,res)=>{
 // ------------- MT4 -------------
 async function closeModals(page){
   await page.evaluate(()=>{
-    for(const sel of ["button[aria-label='Close']", ".modal-header .close", "button.close", "[data-dismiss='modal']"]){
+    for(const sel of ["button[aria-label='Close']",".modal-header .close","button.close","[data-dismiss='modal']"]){
       const b=document.querySelector(sel);
       if(b){ b.click(); }
     }
@@ -364,7 +376,7 @@ async function waitSpinnerGone(page, ms=30000){
   return false;
 }
 async function findAccountsFrame(page){
-  for(let i=0;i<10;i++){
+  for(let i=0;i<12;i++){
     const fr = page.frames().find(f => /avacrm|crm/i.test(f.url()));
     if(fr) return fr;
     await sleep(500);
@@ -406,54 +418,6 @@ async function ensureAccountsUI(page, shots){
   }
   throw new Error("accounts UI not available");
 }
-
-// === NEW HELPERS FOR CREDENTIALS ===
-async function innerText(ctx){
-  try { return await ctx.evaluate(() => document.body?.innerText || ""); }
-  catch { return ""; }
-}
-
-async function readLoginFromAnywhere(ctx){
-  const out = { login:null, server:null };
-  let txt = await innerText(ctx);
-
-  let m = txt.match(/Login\s*:\s*(\d{6,12})/i);
-  if (m) out.login = m[1];
-  let s = txt.match(/Server\s*:\s*([A-Za-z0-9._\-\s]+?(?:Demo|Live)?)/i);
-  if (s) out.server = (s[1] || "").trim();
-  if (out.login) return out;
-
-  try {
-    const guess = await ctx.evaluate(() => {
-      const nodes = Array.from(document.querySelectorAll("*"))
-        .filter(n => /login/i.test(n.textContent || ""));
-      for (const n of nodes){
-        const m2 = (n.textContent || "").match(/(\d{6,12})/);
-        if (m2) return { login: m2[1] };
-      }
-      return null;
-    });
-    if (guess?.login) out.login = guess.login;
-  } catch {}
-
-  return out;
-}
-
-async function goAccountsAndDetectUI(page, shots){
-  await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
-  await waitSpinnerGone(page, 20000);
-  await snap(page,"mt4_01_accounts",shots,true);
-  await dismissBanners(page);
-  await closeModals(page);
-  const ui = await ensureAccountsUI(page, shots);
-  let frame = null;
-  if (ui.mode === "iframe") {
-    frame = ui.frame;
-    if (!frame) throw new Error("accounts iframe not found");
-  }
-  return { mode: ui.mode, frame };
-}
-// === END NEW HELPERS ===
 
 async function clickByText(pageOrFrame, selectors, regex, hover=false){
   const res = await pageOrFrame.evaluate((sels, pattern, hov)=>{
@@ -501,13 +465,40 @@ async function selectOptionGeneric(pageOrFrame, wanted){
   return await clickByText(pageOrFrame, ["li","div","span","button","a"], new RegExp(wanted,"i"));
 }
 
+// ——— helper: čitanje MT4 logina sa bilo kog frame-a ———
+async function readLoginFromAnyFrame(page){
+  const scan = async (ctx) => {
+    try {
+      const txt = await ctx.evaluate(() => document.body?.innerText || "");
+      const m = txt.match(/Login\s*:\s*(\d{6,12})/i);
+      if (m) return m[1];
+    } catch {}
+    return null;
+  };
+  for (const f of page.frames()){
+    const val = await scan(f);
+    if (val) return val;
+  }
+  return await scan(page);
+}
+
+// ——— helper: idi na Accounts i detektuj UI (za re-scan posle submit) ———
+async function goAccountsAndDetectUI(page, shots){
+  await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
+  await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
+  await dismissBanners(page);
+  await closeModals(page);
+  await snap(page,"mt4_01_accounts",shots,true);
+  return await ensureAccountsUI(page, shots);
+}
+
 async function loginMyVip(page, shots, email, password){
   log("PHASE: myvip-login");
   await gotoWithCF(page, "https://myvip.avatrade.com/my_account", shots, "mt4_myvip_nav_cf");
   await snap(page,"mt4_00_myvip",shots,true);
 
-  const emailChoices = ["input[type='email']", "input[name='email']", "#email", "input[name='username']", "input[name='Email']"];
-  const passChoices  = ["input[type='password']", "input[name='password']", "#password", "input[name='Password']"];
+  const emailChoices = ["input[type='email']","input[name='email']","#email","input[name='username']","input[name='Email']"];
+  const passChoices  = ["input[type='password']","input[name='password']","#password","input[name='Password']"];
 
   for(let i=0;i<3;i++){
     try{
@@ -516,10 +507,7 @@ async function loginMyVip(page, shots, email, password){
       await typeJS(page, mailSel, email);
       await typeJS(page, passSel, password);
       await clickJS(page, "button[type='submit'], .btn, button");
-      await Promise.race([
-        sleep(6000),
-        waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000})
-      ]);
+      await Promise.race([ sleep(6000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000}) ]);
       await snap(page,"mt4_00d_myvip_after_login",shots,true);
       return;
     }catch{
@@ -539,12 +527,6 @@ app.post("/create-mt4", async (req,res)=>{
     browser = await launchBrowser();
     const page = await browser.newPage();
 
-    await page.setRequestInterception(true);
-    page.on("request", req=>{
-      const u=req.url(); const t=req.resourceType();
-      if(t==="media" || /doubleclick|facebook|hotjar|segment|optimizely|fullstory|clarity|taboola|criteo/i.test(u)) req.abort();
-      else req.continue();
-    });
     await page.setDefaultTimeout(90000);
     await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
 
@@ -552,20 +534,9 @@ app.post("/create-mt4", async (req,res)=>{
     phase="myvip-login";
     await loginMyVip(page, shots, email, password);
 
-    // 2) accounts
+    // 2) accounts + detect UI
     phase="goto-accounts";
-    await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
-    await Promise.race([
-      sleep(6000),
-      waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000})
-    ]);
-    await dismissBanners(page);
-    await closeModals(page);
-    await snap(page,"mt4_01_accounts",shots,true);
-
-    // 3) UI detect
-    phase="iframe";
-    const ui = await ensureAccountsUI(page, shots);
+    let ui = await goAccountsAndDetectUI(page, shots);
 
     if(ui.mode==="iframe"){
       const frame = ui.frame;
@@ -583,22 +554,16 @@ app.post("/create-mt4", async (req,res)=>{
       await snap(page,"mt4_08_set_iframe",shots);
 
       await clickByText(frame, ["button","a"], /^Submit$/i, false);
-      await waitSpinnerGone(page, 20000);
+      await waitSpinnerGone(page, 30000);
       await snap(page,"mt4_09_after_submit_iframe",shots,true);
 
-      // 1) pokušaj odmah u iframe-u
-      let creds = await readLoginFromAnywhere(frame);
-      let mt4Login = creds.login || null;
-
-      // 2) ako nema – do 3 pokušaja preko "Accounts" liste (reload/return)
-      for (let tryNo = 1; !mt4Login && tryNo <= 3; tryNo++){
-        const ui2 = await goAccountsAndDetectUI(page, shots);
-        if (ui2.mode === "iframe") {
-          creds = await readLoginFromAnywhere(ui2.frame);
-        } else {
-          creds = await readLoginFromAnywhere(page);
-        }
-        mt4Login = creds.login || null;
+      // pokušaj više puta da pročitaš login iz bilo kog frame-a / liste
+      let mt4Login = null;
+      for (let i=0; i<3 && !mt4Login; i++){
+        mt4Login = await readLoginFromAnyFrame(page);
+        if (mt4Login) break;
+        ui = await goAccountsAndDetectUI(page, shots);
+        await sleep(1500);
       }
 
       await snap(page,`mt4_10_result_${mt4Login? "ok":"miss"}`,shots,true);
@@ -622,27 +587,16 @@ app.post("/create-mt4", async (req,res)=>{
     await snap(page,"mt4_spa_set_dds",shots);
 
     await clickByText(page, ["button","a"], /^Submit$/i, false);
-    await Promise.race([
-      sleep(3000),
-      waitNetworkQuiet(page, {idleMs:800, timeoutMs:30000})
-    ]);
+    await Promise.race([ sleep(3000), waitNetworkQuiet(page, {idleMs:800, timeoutMs:30000}) ]);
     await snap(page,"mt4_spa_after_submit",shots,true);
 
-    // 1) odmah na SPA stranici
-    let creds = await readLoginFromAnywhere(page);
-    let mt4Login = creds.login || null;
-
-    // 2) ako nema – do 3 pokušaja preko "Accounts"
-    for (let tryNo = 1; !mt4Login && tryNo <= 3; tryNo++){
-      const ui2 = await goAccountsAndDetectUI(page, shots);
-      if (ui2.mode === "iframe") {
-        creds = await readLoginFromAnywhere(ui2.frame);
-      } else {
-        creds = await readLoginFromAnywhere(page);
-      }
-      mt4Login = creds.login || null;
+    let mt4Login = null;
+    for (let i=0; i<3 && !mt4Login; i++){
+      mt4Login = await readLoginFromAnyFrame(page);
+      if (mt4Login) break;
+      await goAccountsAndDetectUI(page, shots);
+      await sleep(1500);
     }
-
     await snap(page,`mt4_spa_result_${mt4Login? "ok":"miss"}`,shots,true);
 
     const baseUrl = (req.headers["x-forwarded-proto"] || req.protocol) + "://" + req.get("host");
