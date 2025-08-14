@@ -77,6 +77,36 @@ async function dismissBanners(page){
   });
 }
 
+// ---- network idle helper (zamenjuje Playwright-ov page.waitForNetworkIdle) ----
+async function waitNetworkQuiet(page, { idleMs=1000, timeoutMs=60000 } = {}){
+  return new Promise(resolve=>{
+    let inflight = 0;
+    let idleTimer = null;
+    const done = (res)=>{ cleanup(); resolve(res); };
+    const cleanup = ()=>{
+      clearTimeout(timeout);
+      clearTimeout(idleTimer);
+      page.off("request", onReq);
+      page.off("requestfinished", onDone);
+      page.off("requestfailed", onDone);
+    };
+    const kickIdle = ()=>{
+      clearTimeout(idleTimer);
+      if(inflight===0) idleTimer = setTimeout(()=>done(true), idleMs);
+    };
+    const onReq = ()=>{ inflight++; clearTimeout(idleTimer); };
+    const onDone = ()=>{ inflight = Math.max(0, inflight-1); kickIdle(); };
+
+    const timeout = setTimeout(()=>done(false), timeoutMs);
+    page.on("request", onReq);
+    page.on("requestfinished", onDone);
+    page.on("requestfailed", onDone);
+
+    // start odmah pokušajem idle-a
+    kickIdle();
+  });
+}
+
 // ---- Cloudflare-aware goto ----
 async function gotoWithCF(page, url, shots, prefix, maxTries=8){
   for(let i=1;i<=maxTries;i++){
@@ -266,8 +296,8 @@ app.post("/create-demo", async (req,res)=>{
     }, emailSel, passSel);
     await clickJS(page, "button[type='submit']") || await clickJS(page, "button");
     await Promise.race([
-      page.waitForNavigation({waitUntil:"domcontentloaded", timeout:20000}).catch(()=>{}),
       sleep(8000),
+      waitNetworkQuiet(page, {idleMs:800, timeoutMs:20000})
     ]);
     await snap(page, "04_after_submit", shots, true);
 
@@ -343,7 +373,6 @@ async function findAccountsFrame(page){
 }
 
 async function ensureAccountsUI(page, shots){
-  // pokušaj direktno
   let frame = await findAccountsFrame(page);
   if(frame) return { mode:"iframe", frame };
 
@@ -353,7 +382,6 @@ async function ensureAccountsUI(page, shots){
   });
   if(hasAdd) return { mode:"spa", frame:null };
 
-  // do 3 ciklusa: čekaj spinner -> čekaj tekst -> reload
   for(let i=1;i<=3;i++){
     await waitSpinnerGone(page, 20000);
     await closeModals(page);
@@ -370,7 +398,6 @@ async function ensureAccountsUI(page, shots){
 
     const gotText = await waitUntilAccountsText(page, 10000);
     if(gotText){
-      // tekst tu, ali ni iframe ni dugme — probaj opet
       frame = await findAccountsFrame(page);
       if(frame) return { mode:"iframe", frame };
     }
@@ -442,8 +469,8 @@ async function loginMyVip(page, shots, email, password){
       await typeJS(page, passSel, password);
       await clickJS(page, "button[type='submit'], .btn, button");
       await Promise.race([
-        page.waitForNavigation({waitUntil:"domcontentloaded", timeout:60000}).catch(()=>{}),
         sleep(6000),
+        waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000})
       ]);
       await snap(page,"mt4_00d_myvip_after_login",shots,true);
       return;
@@ -481,8 +508,8 @@ app.post("/create-mt4", async (req,res)=>{
     phase="goto-accounts";
     await gotoWithCF(page, "https://webtrader7.avatrade.com/crm/accounts", shots, "mt4_accounts_nav");
     await Promise.race([
-      page.waitForNetworkIdle({idleTime:1000, timeout:60000}).catch(()=>{}),
       sleep(6000),
+      waitNetworkQuiet(page, {idleMs:800, timeoutMs:60000})
     ]);
     await dismissBanners(page);
     await closeModals(page);
@@ -539,8 +566,8 @@ app.post("/create-mt4", async (req,res)=>{
 
     await clickByText(page, ["button","a"], /^Submit$/i, false);
     await Promise.race([
-      page.waitForNetworkIdle({idleTime:1000, timeout:30000}).catch(()=>{}),
       sleep(3000),
+      waitNetworkQuiet(page, {idleMs:800, timeoutMs:30000})
     ]);
     await snap(page,"mt4_spa_after_submit",shots,true);
 
